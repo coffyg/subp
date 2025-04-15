@@ -13,7 +13,6 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// TestProcessPool verifies basic functionality.
 func TestProcessPool(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "processpool_test")
 	if err != nil {
@@ -61,10 +60,8 @@ func main() {
 	}
 }
 `
-
 	workerFilePath := filepath.Join(tmpDir, "test_worker.go")
-	err = os.WriteFile(workerFilePath, []byte(workerProgram), 0644)
-	if err != nil {
+	if err := os.WriteFile(workerFilePath, []byte(workerProgram), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -89,34 +86,32 @@ func main() {
 		2*time.Second,
 	)
 
-	err = pool.WaitForReady()
-	if err != nil {
+	if err := pool.WaitForReady(); err != nil {
 		t.Fatal(err)
 	}
 
 	for i := 0; i < 5; i++ {
-		c := map[string]interface{}{
+		cmdData := map[string]interface{}{
 			"data": fmt.Sprintf("test data %d", i),
 		}
-		response, err := pool.SendCommand(c)
+		resp, err := pool.SendCommand(cmdData)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if response["type"] != "success" {
-			t.Errorf("Expected response type 'success', got '%v'", response["type"])
+		if resp["type"] != "success" {
+			t.Errorf("Expected 'success', got '%v'", resp["type"])
 		}
-		if response["message"] != "ok" {
-			t.Errorf("Expected message 'ok', got '%v'", response["message"])
+		if resp["message"] != "ok" {
+			t.Errorf("Expected 'ok', got '%v'", resp["message"])
 		}
-		if response["data"] != c["data"] {
-			t.Errorf("Expected data '%v', got '%v'", c["data"], response["data"])
+		if resp["data"] != cmdData["data"] {
+			t.Errorf("Expected '%v', got '%v'", cmdData["data"], resp["data"])
 		}
 	}
 
 	pool.StopAll()
 }
 
-// TestProcessPoolSpeed runs multiple commands to gauge performance.
 func TestProcessPoolSpeed(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "processpool_speed")
 	if err != nil {
@@ -165,8 +160,7 @@ func main() {
 }
 `
 	workerFilePath := filepath.Join(tmpDir, "test_worker_speed.go")
-	err = os.WriteFile(workerFilePath, []byte(workerProgram), 0644)
-	if err != nil {
+	if err := os.WriteFile(workerFilePath, []byte(workerProgram), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -201,26 +195,23 @@ func main() {
 	wg.Add(numCommands)
 
 	for i := 0; i < numCommands; i++ {
-		go func(index int) {
+		go func(idx int) {
 			defer wg.Done()
 			cmdData := map[string]interface{}{
-				"data": fmt.Sprintf("speed test %d", index),
+				"data": fmt.Sprintf("speed test %d", idx),
 			}
 			_, err := pool.SendCommand(cmdData)
 			if err != nil {
-				t.Errorf("Command %d failed: %v", index, err)
+				t.Errorf("Command %d failed: %v", idx, err)
 			}
 		}(i)
 	}
-
 	wg.Wait()
-	duration := time.Since(start)
+	elapsed := time.Since(start)
+	t.Logf("Processed %d commands in %v with 3 processes", numCommands, elapsed)
 	pool.StopAll()
-
-	t.Logf("Processed %d commands in %v using 3 processes.", numCommands, duration)
 }
 
-// TestProcessPoolParallel verifies correctness under parallel loads.
 func TestProcessPoolParallel(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "processpool_parallel")
 	if err != nil {
@@ -269,8 +260,7 @@ func main() {
 }
 `
 	workerFilePath := filepath.Join(tmpDir, "test_worker_parallel.go")
-	err = os.WriteFile(workerFilePath, []byte(workerProgram), 0644)
-	if err != nil {
+	if err := os.WriteFile(workerFilePath, []byte(workerProgram), 0644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -303,32 +293,31 @@ func main() {
 	numCommands := 100
 	results := make([]int, numCommands)
 	var mu sync.Mutex
-
 	var wg sync.WaitGroup
 	wg.Add(numCommands)
 
 	for i := 0; i < numCommands; i++ {
-		go func(index int) {
+		go func(idx int) {
 			defer wg.Done()
 			cmdData := map[string]interface{}{
-				"data": fmt.Sprintf("parallel test %d", index),
+				"data": fmt.Sprintf("parallel test %d", idx),
 			}
 			resp, err := pool.SendCommand(cmdData)
 			if err != nil {
-				t.Errorf("Error in parallel command %d: %v", index, err)
+				t.Errorf("Error in parallel command %d: %v", idx, err)
 				return
 			}
 			if resp["type"] != "success" {
 				t.Errorf("Expected 'success', got %v", resp["type"])
+				return
 			}
 			mu.Lock()
-			results[index] = index
+			results[idx] = idx
 			mu.Unlock()
 		}(i)
 	}
 
 	wg.Wait()
-
 	for i := 0; i < numCommands; i++ {
 		if results[i] != i {
 			t.Errorf("Result mismatch at index %d: got %d, expected %d", i, results[i], i)

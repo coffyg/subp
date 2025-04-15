@@ -1,4 +1,3 @@
-// process_pool.go
 package subp
 
 import (
@@ -40,10 +39,14 @@ type Process struct {
 	pool            *ProcessPool
 	wg              sync.WaitGroup
 
-	// Added fields
 	stdinPipe  io.WriteCloser
 	stdoutPipe io.ReadCloser
 	stderrPipe io.ReadCloser
+
+	// Channels and maps for concurrency
+	responseMap sync.Map
+	readyChan   chan struct{}
+	readyOnce   sync.Once
 }
 
 // ProcessExport exports process information.
@@ -55,9 +58,10 @@ type ProcessExport struct {
 	RequestsHandled int    `json:"RequestsHandled"`
 }
 
-// Start starts the process by creating a new exec.Cmd, setting up the stdin and stdout pipes, and starting the process.
+// Start starts the process.
 func (p *Process) Start() {
 	p.SetReady(0)
+
 	cmd := exec.Command(p.cmdStr, p.cmdArgs...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
@@ -83,13 +87,21 @@ func (p *Process) Start() {
 	p.stdin = json.NewEncoder(stdinPipe)
 	p.stdout = bufio.NewReader(stdoutPipe)
 	p.stderr = bufio.NewReader(stderrPipe)
+	p.readyChan = make(chan struct{})
 	p.mutex.Unlock()
 
-	p.wg.Add(2)
+	p.wg.Add(3)
+
 	go func() {
 		defer p.wg.Done()
 		p.readStderr()
 	}()
+
+	go func() {
+		defer p.wg.Done()
+		p.readStdout()
+	}()
+
 	go func() {
 		defer p.wg.Done()
 		p.WaitForReadyScan()
@@ -102,7 +114,7 @@ func (p *Process) Start() {
 	}
 }
 
-// Stop stops the process by sending a kill signal to the process and cleaning up the resources.
+// Stop stops the process.
 func (p *Process) Stop() {
 	p.SetReady(0)
 	if p.cmd != nil && p.cmd.Process != nil {
@@ -183,30 +195,57 @@ func (p *Process) readStderr() {
 	}
 }
 
-// WaitForReadyScan waits for the process to send a "ready" message.
-func (p *Process) WaitForReadyScan() {
+// readStdout continuously reads lines from stdout.
+func (p *Process) readStdout() {
 	for {
 		line, err := p.stdout.ReadString('\n')
 		if err != nil {
-			p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
+			if err != io.EOF {
+				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
+			}
 			p.Restart()
 			return
 		}
 		if line == "" || line == "\n" {
 			continue
 		}
-
 		var response map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &response); err != nil {
 			p.logger.Warn().Msgf("[nyxsub|%s] Non JSON message received: '%s'", p.name, line)
 			continue
 		}
-
-		if response["type"] == "ready" {
-			p.logger.Info().Msgf("[nyxsub|%s] Process is ready", p.name)
-			p.SetReady(1)
-			return
+		if t, ok := response["type"].(string); ok && t == "ready" {
+			p.readyOnce.Do(func() {
+				p.logger.Info().Msgf("[nyxsub|%s] Process is ready", p.name)
+				p.SetReady(1)
+				close(p.readyChan)
+			})
+			continue
 		}
+		if idVal, ok := response["id"].(string); ok {
+			if ch, ok := p.responseMap.Load(idVal); ok {
+				castCh := ch.(chan map[string]interface{})
+				select {
+				case castCh <- response:
+				default:
+				}
+			}
+		}
+	}
+}
+
+// WaitForReadyScan waits for the process to send a "ready" message.
+func (p *Process) WaitForReadyScan() {
+	timer := time.NewTimer(p.initTimeout)
+	defer timer.Stop()
+
+	select {
+	case <-p.readyChan:
+		return
+	case <-timer.C:
+		p.logger.Error().Msgf("[nyxsub|%s] Init timeout: process not ready in time", p.name)
+		p.Restart()
+		return
 	}
 }
 
@@ -224,18 +263,15 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 	start := time.Now().UnixMilli()
 
-	// Send command
 	if err := p.stdin.Encode(cmd); err != nil {
 		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to send command", p.name)
 		p.Restart()
 		return nil, err
 	}
 
-	// Log the command sent
 	jsonCmd, _ := json.Marshal(cmd)
 	p.logger.Debug().Msgf("[nyxsub|%s] Command sent: %v", p.name, string(jsonCmd))
 
-	// Wait for response
 	response, err := p.readResponse(cmd["id"].(string))
 	if err != nil {
 		p.Restart()
@@ -252,34 +288,18 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 // readResponse reads the response for a specific command ID.
 func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
+	ch := make(chan map[string]interface{}, 1)
+	p.responseMap.Store(cmdID, ch)
+	defer p.responseMap.Delete(cmdID)
+
 	timeout := time.After(p.timeout)
 
-	for {
-		select {
-		case <-timeout:
-			p.logger.Error().Msgf("[nyxsub|%s] Communication timed out", p.name)
-			return nil, errors.New("communication timed out")
-		default:
-			line, err := p.stdout.ReadString('\n')
-			if err != nil {
-				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
-				return nil, err
-			}
-			if line == "" || line == "\n" {
-				continue
-			}
-
-			var response map[string]interface{}
-			if err := json.Unmarshal([]byte(line), &response); err != nil {
-				p.logger.Warn().Msgf("[nyxsub|%s] Non JSON message received: '%s'", p.name, line)
-				continue
-			}
-
-			// Check for matching response ID
-			if response["id"] == cmdID {
-				return response, nil
-			}
-		}
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-timeout:
+		p.logger.Error().Msgf("[nyxsub|%s] Communication timed out", p.name)
+		return nil, errors.New("communication timed out")
 	}
 }
 
@@ -482,7 +502,6 @@ func (pq *ProcessPQ) Update() {
 	defer pq.mutex.Unlock()
 
 	pq.processes = nil
-
 	pq.pool.mutex.RLock()
 	defer pq.pool.mutex.RUnlock()
 
@@ -494,6 +513,5 @@ func (pq *ProcessPQ) Update() {
 			})
 		}
 	}
-
 	heap.Init(pq)
 }
