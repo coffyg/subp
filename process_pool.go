@@ -523,9 +523,17 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 		}
 	}
 
+	// CRITICAL FIX: For commands that may take a while (like SSR),
+	// communication timeout must be generous enough to accommodate the operation
+	// Minimum 5 seconds or 5x the configured timeout, whichever is greater
+	effectiveTimeout := p.timeout
+	if effectiveTimeout < 5*time.Second {
+		effectiveTimeout = 5 * time.Second
+	}
+	
 	// Wait for response with timeout - use a reusable timer
 	timer := timerPool.Get().(*time.Timer)
-	resetTimer(timer, p.timeout)
+	resetTimer(timer, effectiveTimeout)
 	defer timerPool.Put(timer)
 	
 	var response map[string]interface{}
@@ -535,7 +543,7 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 		// Success, got response
 		err = nil
 	case <-timer.C:
-		p.logger.Error().Msgf("process=%s error=timeout action=communication", p.name)
+		p.logger.Error().Msgf("process=%s error=timeout action=communication timeout=%v", p.name, effectiveTimeout)
 		err = &SubpError{Op: "SendCommand", Err: errors.New("communication timeout")}
 		
 		// Don't restart process for timeouts - this is causing cascading failures
@@ -562,11 +570,17 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 	p.responseMap.Store(cmdID, responseCh)
 	defer p.responseMap.Delete(cmdID)
 
+	// Apply same timeout logic as SendCommand
+	effectiveTimeout := p.timeout
+	if effectiveTimeout < 5*time.Second {
+		effectiveTimeout = 5 * time.Second
+	}
+
 	select {
 	case resp := <-responseCh:
 		return resp, nil
-	case <-time.After(p.timeout):
-		p.logger.Error().Msgf("process=%s error=timeout action=communication", p.name)
+	case <-time.After(effectiveTimeout):
+		p.logger.Error().Msgf("process=%s error=timeout action=communication timeout=%v", p.name, effectiveTimeout)
 		return nil, errors.New("communication timed out")
 	}
 }
