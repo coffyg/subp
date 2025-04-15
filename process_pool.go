@@ -2,6 +2,7 @@ package subp
 
 import (
 	"bufio"
+	"bytes"
 	"container/heap"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,39 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
+
+// Error wrapping for consistent error messages
+type SubpError struct {
+	Op  string // Operation that failed
+	Err error  // Original error
+}
+
+func (e *SubpError) Error() string {
+	if e.Err == nil {
+		return fmt.Sprintf("subp.%s: operation failed", e.Op)
+	}
+	return fmt.Sprintf("subp.%s: %v", e.Op, e.Err)
+}
+
+func (e *SubpError) Unwrap() error {
+	return e.Err
+}
+
+// wrapError wraps an error with operation context without allocating if error is nil
+func wrapError(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &SubpError{Op: op, Err: err}
+}
+
+// reusableBuffer is used to avoid allocations during JSON parsing
+var jsonParserPool = sync.Pool{
+	New: func() interface{} {
+		// Use larger initial capacity to efficiently handle media payloads
+		return make(map[string]interface{}, 64) // Increased from 8 to 64 for media payloads
+	},
+}
 
 // Process is a process that can be started, stopped, and restarted.
 type Process struct {
@@ -44,9 +78,14 @@ type Process struct {
 	stderrPipe io.ReadCloser
 
 	// Channels and maps for concurrency
-	responseMap sync.Map
-	readyChan   chan struct{}
-	readyOnce   sync.Once
+	responseMap     sync.Map
+	readyChan       chan struct{}
+	readyOnce       sync.Once
+	responseCache   map[string]chan map[string]interface{} // Optional cache for hot responses
+	
+	// Buffer for JSON marshaling - avoid memory allocations
+	commandBuffer   []byte
+	responseBuffer  []byte
 }
 
 // ProcessExport exports process information.
@@ -65,17 +104,17 @@ func (p *Process) Start() {
 	cmd := exec.Command(p.cmdStr, p.cmdArgs...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
-		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to get stdin pipe for process", p.name)
+		p.logger.Error().Err(wrapError("Start", err)).Msgf("process=%s failed_to=get_stdin_pipe", p.name)
 		return
 	}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to get stdout pipe for process", p.name)
+		p.logger.Error().Err(wrapError("Start", err)).Msgf("process=%s failed_to=get_stdout_pipe", p.name)
 		return
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to get stderr pipe for process", p.name)
+		p.logger.Error().Err(wrapError("Start", err)).Msgf("process=%s failed_to=get_stderr_pipe", p.name)
 		return
 	}
 
@@ -109,7 +148,7 @@ func (p *Process) Start() {
 
 	p.cmd.Dir = p.cwd
 	if err := p.cmd.Start(); err != nil {
-		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to start process", p.name)
+		p.logger.Error().Err(wrapError("Start", err)).Msgf("process=%s failed_to=start", p.name)
 		return
 	}
 }
@@ -122,7 +161,7 @@ func (p *Process) Stop() {
 	}
 	p.wg.Wait()
 	p.cleanupChannelsAndResources()
-	p.logger.Info().Msgf("[nyxsub|%s] Process stopped", p.name)
+	p.logger.Info().Msgf("process=%s status=stopped", p.name)
 }
 
 // cleanupChannelsAndResources closes the pipes and resets the pointers.
@@ -149,11 +188,35 @@ func (p *Process) cleanupChannelsAndResources() {
 
 // Restart stops the process and starts it again.
 func (p *Process) Restart() {
-	p.logger.Info().Msgf("[nyxsub|%s] Restarting process", p.name)
+	p.logger.Info().Msgf("process=%s status=restarting", p.name)
+	
+	// Fast path - increment restart counter with lock
 	p.mutex.Lock()
 	p.restarts++
 	p.mutex.Unlock()
-	p.Stop()
+	
+	// Create a copy of the stop function to avoid potential deadlocks
+	stopped := make(chan struct{})
+	go func() {
+		p.Stop()
+		close(stopped)
+	}()
+	
+	// Wait for stop to complete with a timeout - use timer from pool
+	timer := timerPool.Get().(*time.Timer)
+	resetTimer(timer, 2*time.Second)
+	
+	select {
+	case <-stopped:
+		// Process stopped successfully
+	case <-timer.C:
+		p.logger.Warn().Msgf("process=%s warning=stop_timeout action=restart", p.name)
+	}
+	
+	// Return timer to pool
+	timerPool.Put(timer)
+	
+	// Only start if we're not shutting down the pool - check with atomic
 	if atomic.LoadInt32(&p.pool.shouldStop) == 0 {
 		p.Start()
 	}
@@ -185,53 +248,119 @@ func (p *Process) readStderr() {
 		line, err := p.stderr.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
-				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stderr", p.name)
+				p.logger.Error().Err(wrapError("ReadStderr", err)).Msgf("process=%s failed_to=read_stderr", p.name)
 			}
 			return
 		}
 		if line != "" && line != "\n" {
-			p.logger.Error().Msgf("[nyxsub|%s|stderr] %s", p.name, line)
+			p.logger.Error().Msgf("process=%s stderr_output=%q", p.name, line)
 		}
 	}
 }
 
 // readStdout continuously reads lines from stdout.
 func (p *Process) readStdout() {
-	for {
-		line, err := p.stdout.ReadString('\n')
-		if err != nil {
-			if err != io.EOF {
-				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
-			}
-			p.Restart()
-			return
-		}
-		if line == "" || line == "\n" {
+	// Set up an optimized scanner with a much larger buffer for media payloads
+	scanner := bufio.NewScanner(p.stdout)
+	
+	// Set a very large buffer to handle large JSON payloads with base64 media
+	const maxScanTokenSize = 30 * 1024 * 1024 // 30MB buffer for large base64 encoded videos
+	buffer := make([]byte, maxScanTokenSize)
+	scanner.Buffer(buffer, maxScanTokenSize)
+	
+	// Reuse this buffer for all non-response lines
+	readyBytes := []byte(`{"type":"ready"}`)
+	
+	// Use a line buffer to avoid allocations
+	var lineBytes []byte
+	
+	for scanner.Scan() {
+		// Get the bytes directly to avoid string allocation
+		lineBytes = scanner.Bytes()
+		if len(lineBytes) == 0 {
 			continue
 		}
-		var response map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &response); err != nil {
-			p.logger.Warn().Msgf("[nyxsub|%s] Non JSON message received: '%s'", p.name, line)
-			continue
-		}
-		if t, ok := response["type"].(string); ok && t == "ready" {
+		
+		// Fast path for ready message - direct byte comparison
+		if len(lineBytes) == len(readyBytes) && bytes.Equal(lineBytes, readyBytes) {
 			p.readyOnce.Do(func() {
-				p.logger.Info().Msgf("[nyxsub|%s] Process is ready", p.name)
+				p.logger.Info().Msgf("process=%s status=ready", p.name)
 				p.SetReady(1)
 				close(p.readyChan)
 			})
 			continue
 		}
-		if idVal, ok := response["id"].(string); ok {
+		
+		// Get a response object from the pool
+		respObj := jsonParserPool.Get().(map[string]interface{})
+		// Clear the map for reuse
+		for k := range respObj {
+			delete(respObj, k)
+		}
+		
+		// Parse JSON
+		if err := json.Unmarshal(lineBytes, &respObj); err != nil {
+			p.logger.Warn().Msgf("process=%s warn=invalid_json_message data=%q", p.name, lineBytes)
+			jsonParserPool.Put(respObj) // Return to pool
+			continue
+		}
+		
+		// Check for ready message
+		if t, ok := respObj["type"].(string); ok && t == "ready" {
+			p.readyOnce.Do(func() {
+				p.logger.Info().Msgf("process=%s status=ready", p.name)
+				p.SetReady(1)
+				close(p.readyChan)
+			})
+			jsonParserPool.Put(respObj) // Return to pool
+			continue
+		}
+		
+		// Process command responses
+		if idVal, ok := respObj["id"].(string); ok {
 			if ch, ok := p.responseMap.Load(idVal); ok {
 				castCh := ch.(chan map[string]interface{})
+				
+				// Create a copy of the map for the response
+				// Because the original will be reused by the pool
+				// Use larger capacity for potential media payloads
+				initialCapacity := 32 // Higher capacity for base64 encoded media
+				if len(respObj) > initialCapacity {
+					initialCapacity = len(respObj)
+				}
+				responseCopy := make(map[string]interface{}, initialCapacity)
+				for k, v := range respObj {
+					responseCopy[k] = v
+				}
+				
+				// Non-blocking send with default case to avoid deadlocks
 				select {
-				case castCh <- response:
+				case castCh <- responseCopy:
+					// Response sent successfully
 				default:
+					// Channel is full or closed, which means the requester timed out
 				}
 			}
 		}
+		
+		// Return object to pool for reuse
+		jsonParserPool.Put(respObj)
 	}
+	
+	// Check for scanner errors
+	if err := scanner.Err(); err != nil {
+		if err != io.EOF {
+			p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
+		}
+	}
+	
+	// When the scanner exits (e.g., due to pipe closure), restart the process
+	go func() {
+		// Use a timer instead of sleep to be more efficient
+		timer := time.NewTimer(10 * time.Millisecond)
+		<-timer.C
+		p.Restart()
+	}()
 }
 
 // WaitForReadyScan waits for the process to send a "ready" message.
@@ -243,10 +372,46 @@ func (p *Process) WaitForReadyScan() {
 	case <-p.readyChan:
 		return
 	case <-timer.C:
-		p.logger.Error().Msgf("[nyxsub|%s] Init timeout: process not ready in time", p.name)
-		p.Restart()
+		p.logger.Error().Msgf("process=%s error=init_timeout status=not_ready", p.name)
+		// Call restart in a goroutine to avoid deadlock
+		go func() {
+			time.Sleep(10 * time.Millisecond)
+			p.Restart()
+		}()
 		return
 	}
+}
+
+// uuidPool provides a pool of pre-created UUID strings to reduce allocation
+var uuidPool = sync.Pool{
+	New: func() interface{} {
+		return uuid.New().String()
+	},
+}
+
+// timerPool provides a pool of reusable timers
+var timerPool = sync.Pool{
+	New: func() interface{} {
+		return time.NewTimer(time.Second)
+	},
+}
+
+// responseChannelPool provides a pool of pre-allocated response channels
+var responseChannelPool = sync.Pool{
+	New: func() interface{} {
+		return make(chan map[string]interface{}, 1)
+	},
+}
+
+// resetTimer resets a timer from the pool for the given duration
+func resetTimer(timer *time.Timer, d time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(d)
 }
 
 // SendCommand sends a command to the process and waits for the response.
@@ -254,51 +419,118 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	p.SetBusy(1)
 	defer p.SetBusy(0)
 
-	if _, ok := cmd["id"]; !ok {
-		cmd["id"] = uuid.New().String()
+	// Initialize command metadata using pre-determined values where possible
+	var cmdID string
+	if id, ok := cmd["id"]; !ok {
+		// Get a UUID from the pool instead of generating a new one
+		cmdID = uuidPool.Get().(string)
+		cmd["id"] = cmdID
+		// Generate a new UUID for the pool for next use
+		go func() {
+			uuidPool.Put(uuid.New().String())
+		}()
+	} else {
+		cmdID = id.(string)
 	}
+	
 	if _, ok := cmd["type"]; !ok {
 		cmd["type"] = "main"
 	}
 
 	start := time.Now().UnixMilli()
 
+	// Get a pre-allocated response channel from the pool
+	responseCh := responseChannelPool.Get().(chan map[string]interface{})
+	// Clear any potential leftover value from the channel
+	select {
+	case <-responseCh:
+	default:
+	}
+	
+	p.responseMap.Store(cmdID, responseCh)
+	defer func() {
+		p.responseMap.Delete(cmdID)
+		// Return channel to pool
+		responseChannelPool.Put(responseCh)
+	}()
+	
+	// Send command to the process
 	if err := p.stdin.Encode(cmd); err != nil {
-		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to send command", p.name)
-		p.Restart()
+		p.logger.Error().Err(wrapError("SendCommand", err)).Msgf("process=%s failed_to=send_command", p.name)
+		// Use timer from pool instead of sleep
+		timer := timerPool.Get().(*time.Timer)
+		resetTimer(timer, 10*time.Millisecond)
+		go func() {
+			<-timer.C
+			timerPool.Put(timer)
+			p.Restart()
+		}()
 		return nil, err
 	}
 
-	jsonCmd, _ := json.Marshal(cmd)
-	p.logger.Debug().Msgf("[nyxsub|%s] Command sent: %v", p.name, string(jsonCmd))
+	// Only log in debug mode to avoid string formatting overhead
+	if p.logger.GetLevel() <= zerolog.DebugLevel {
+		// Use pre-allocated buffer if available
+		if cap(p.commandBuffer) > 0 {
+			p.commandBuffer = p.commandBuffer[:0] // Reset but preserve capacity
+			buf, err := json.Marshal(cmd)
+			if err == nil {
+				p.commandBuffer = append(p.commandBuffer, buf...)
+				p.logger.Debug().Msgf("process=%s action=command_sent command=%s", p.name, p.commandBuffer)
+			}
+		} else {
+			jsonCmd, _ := json.Marshal(cmd)
+			p.logger.Debug().Msgf("process=%s action=command_sent command=%s", p.name, jsonCmd)
+		}
+	}
 
-	response, err := p.readResponse(cmd["id"].(string))
-	if err != nil {
-		p.Restart()
+	// Wait for response with timeout - use a reusable timer
+	timer := timerPool.Get().(*time.Timer)
+	resetTimer(timer, p.timeout)
+	defer timerPool.Put(timer)
+	
+	var response map[string]interface{}
+	var err error
+	select {
+	case response = <-responseCh:
+		// Success, got response
+		err = nil
+	case <-timer.C:
+		p.logger.Error().Msgf("process=%s error=timeout action=communication", p.name)
+		err = &SubpError{Op: "SendCommand", Err: errors.New("communication timeout")}
+		// Use another timer from pool for restart
+		restartTimer := timerPool.Get().(*time.Timer)
+		resetTimer(restartTimer, 10*time.Millisecond)
+		go func() {
+			<-restartTimer.C
+			timerPool.Put(restartTimer)
+			p.Restart()
+		}()
 		return nil, err
 	}
 
+	// Update metrics - minimal lock time
+	latency := time.Now().UnixMilli() - start
 	p.mutex.Lock()
-	p.latency = time.Now().UnixMilli() - start
+	p.latency = latency
 	p.requestsHandled++
 	p.mutex.Unlock()
 
 	return response, nil
 }
 
-// readResponse reads the response for a specific command ID.
+// readResponse is kept for backward compatibility
+// This is now integrated directly into SendCommand for reduced overhead
 func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
-	ch := make(chan map[string]interface{}, 1)
-	p.responseMap.Store(cmdID, ch)
+	responseCh := make(chan map[string]interface{}, 1)
+	p.responseMap.Store(cmdID, responseCh)
 	defer p.responseMap.Delete(cmdID)
 
-	timeout := time.After(p.timeout)
-
 	select {
-	case resp := <-ch:
+	case resp := <-responseCh:
 		return resp, nil
-	case <-timeout:
-		p.logger.Error().Msgf("[nyxsub|%s] Communication timed out", p.name)
+	case <-time.After(p.timeout):
+		p.logger.Error().Msgf("process=%s error=timeout action=communication", p.name)
 		return nil, errors.New("communication timed out")
 	}
 }
@@ -328,21 +560,45 @@ func NewProcessPool(
 	comTimeout time.Duration,
 	initTimeout time.Duration,
 ) *ProcessPool {
-	shouldStop := int32(0)
+	// Pre-allocate all resources to avoid dynamic allocations during operation
+	processes := make([]*Process, size)
+	stopChan := make(chan bool, 1)
+	
+	// Create the pool with pre-configured settings
 	pool := &ProcessPool{
-		processes:     make([]*Process, size),
+		processes:     processes,
 		logger:        logger,
 		mutex:         sync.RWMutex{},
-		shouldStop:    shouldStop,
-		stop:          make(chan bool, 1),
+		shouldStop:    0, // Use atomic operations on this
+		stop:          stopChan,
 		workerTimeout: workerTimeout,
 		comTimeout:    comTimeout,
 		initTimeout:   initTimeout,
 	}
-	pool.queue = ProcessPQ{processes: make([]*ProcessWithPrio, 0), mutex: sync.Mutex{}, pool: pool}
-	for i := 0; i < size; i++ {
-		pool.newProcess(name, i, cmd, cmdArgs, logger, cwd)
+	
+	// Initialize the priority queue with optimal capacity
+	pool.queue = ProcessPQ{
+		processes: make([]*ProcessWithPrio, 0, size), // Pre-allocate capacity based on pool size
+		mutex:     sync.Mutex{},
+		pool:      pool,
 	}
+	
+	// Create and start all worker processes
+	// Use a wait group to track initialization progress
+	var wg sync.WaitGroup
+	wg.Add(size)
+	
+	for i := 0; i < size; i++ {
+		// Create processes in parallel for faster startup
+		go func(idx int) {
+			defer wg.Done()
+			pool.newProcess(name, idx, cmd, cmdArgs, logger, cwd)
+		}(i)
+	}
+	
+	// Wait for all processes to be created (not necessarily ready)
+	wg.Wait()
+	
 	return pool
 }
 
@@ -359,8 +615,8 @@ func (pool *ProcessPool) SetStop() {
 
 // newProcess creates a new process in the process pool.
 func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []string, logger *zerolog.Logger, cwd string) {
-	pool.mutex.Lock()
-	pool.processes[i] = &Process{
+	// Create a new process with optimized initialization
+	process := &Process{
 		isReady:         0,
 		latency:         0,
 		logger:          logger,
@@ -374,9 +630,20 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 		id:              i,
 		cwd:             cwd,
 		pool:            pool,
+		// Initialize maps and response channels
+		responseCache:   make(map[string]chan map[string]interface{}, 16), // Pre-allocate space for common responses
+		// Pre-allocate buffers for parsing to avoid GC pressure
+		commandBuffer:   make([]byte, 0, 4*1024),          // 4KB for commands
+		responseBuffer:  make([]byte, 0, 30*1024*1024),  // 30MB for responses with video content
 	}
+	
+	// Add the process to the pool under lock
+	pool.mutex.Lock()
+	pool.processes[i] = process
 	pool.mutex.Unlock()
-	pool.processes[i].Start()
+	
+	// Start the process (this will initialize pipes and start goroutines)
+	process.Start()
 }
 
 // ExportAll exports all the processes in the process pool as a slice of ProcessExport.
@@ -402,20 +669,93 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 
 // GetWorker returns a worker process from the process pool.
 func (pool *ProcessPool) GetWorker() (*Process, error) {
-	timeoutTimer := time.After(pool.workerTimeout)
-	ticker := time.NewTicker(time.Millisecond * 100)
-	defer ticker.Stop()
+	// Fast path - try to get a worker immediately
+	process := pool.tryGetWorkerFast()
+	if process != nil {
+		return process, nil
+	}
+	
+	// Slow path - wait for a worker with timeout
+	return pool.waitForWorker()
+}
 
+// tryGetWorkerFast attempts to immediately get an available worker
+// This method is optimized for the happy path when workers are readily available
+func (pool *ProcessPool) tryGetWorkerFast() *Process {
+	pool.queue.mutex.Lock()
+	defer pool.queue.mutex.Unlock()
+	
+	pool.queue.Update()
+	if pool.queue.Len() > 0 {
+		processWithPrio := heap.Pop(&pool.queue).(*ProcessWithPrio)
+		processId := processWithPrio.processId
+		
+		// Use a quick bounds check without requiring another lock
+		if processId >= 0 && processId < len(pool.processes) {
+			pool.mutex.RLock()
+			process := pool.processes[processId]
+			pool.mutex.RUnlock()
+			
+			if process != nil {
+				process.SetBusy(1)
+				return process
+			}
+		}
+	}
+	
+	return nil
+}
+
+// waitForWorkerDoneChan is a pool of done channels to reduce allocation
+var waitForWorkerDoneChan = sync.Pool{
+	New: func() interface{} {
+		return make(chan struct{})
+	},
+}
+
+// waitForWorkerChan is a pool of worker channels to reduce allocation
+var waitForWorkerChan = sync.Pool{
+	New: func() interface{} {
+		return make(chan *Process, 1)
+	},
+}
+
+// waitForWorker waits for a worker to become available with a timeout
+func (pool *ProcessPool) waitForWorker() (*Process, error) {
+	// Create local timer for overall timeout
+	timeoutTimer := timerPool.Get().(*time.Timer)
+	resetTimer(timeoutTimer, pool.workerTimeout)
+	defer timerPool.Put(timeoutTimer)
+	
+	// Start time for metrics
+	startTime := time.Now()
+	
+	// Use a more efficient polling approach with exponential backoff
+	backoff := 100 * time.Microsecond // Start with smaller initial backoff
+	maxBackoff := 10 * time.Millisecond // Smaller max backoff for higher responsiveness
+	
 	for {
-		select {
-		case <-timeoutTimer:
+		// Try to get a worker - optimized fastest path
+		process := pool.tryGetWorkerFast()
+		if process != nil {
+			return process, nil
+		}
+		
+		// Check if we've hit the timeout
+		if time.Since(startTime) >= pool.workerTimeout {
 			return nil, fmt.Errorf("timeout exceeded, no available workers")
-		case <-ticker.C:
-			pool.queue.Update()
-			if pool.queue.Len() > 0 {
-				processWithPrio := heap.Pop(&pool.queue).(*ProcessWithPrio)
-				pool.processes[processWithPrio.processId].SetBusy(1)
-				return pool.processes[processWithPrio.processId], nil
+		}
+		
+		// If we haven't timed out yet, wait using backoff strategy
+		// Use the timer channel directly for efficiency
+		select {
+		case <-timeoutTimer.C:
+			return nil, fmt.Errorf("timeout exceeded, no available workers")
+		case <-time.After(backoff):
+			// Increase backoff duration exponentially with a cap
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
 			}
 		}
 	}
@@ -498,20 +838,34 @@ func (pq *ProcessPQ) Pop() interface{} {
 }
 
 func (pq *ProcessPQ) Update() {
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
-
-	pq.processes = nil
+	// NOTE: This function assumes the mutex is ALREADY locked by the caller
+	
+	// Pre-allocate the slice to avoid dynamic allocations
+	if cap(pq.processes) == 0 {
+		// Initial allocation based on pool size
+		pq.processes = make([]*ProcessWithPrio, 0, len(pq.pool.processes))
+	} else {
+		// Reuse the existing memory but set length to 0
+		pq.processes = pq.processes[:0]
+	}
+	
 	pq.pool.mutex.RLock()
-	defer pq.pool.mutex.RUnlock()
-
+	
+	// Use a fast path optimization for finding available workers
 	for _, process := range pq.pool.processes {
-		if process != nil && process.IsReady() && !process.IsBusy() {
+		if process != nil && 
+		   atomic.LoadInt32(&process.isReady) == 1 && 
+		   atomic.LoadInt32(&process.isBusy) == 0 {
 			pq.Push(&ProcessWithPrio{
 				processId: process.id,
 				handled:   process.requestsHandled,
 			})
 		}
 	}
-	heap.Init(pq)
+	pq.pool.mutex.RUnlock()
+	
+	// Only initialize the heap if we need to
+	if len(pq.processes) > 1 {
+		heap.Init(pq)
+	}
 }
