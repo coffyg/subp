@@ -186,8 +186,25 @@ func (p *Process) cleanupChannelsAndResources() {
 	p.mutex.Unlock()
 }
 
+// Protects process restart to avoid concurrent restarts
+var processRestartMutex = sync.Map{}
+
 // Restart stops the process and starts it again.
 func (p *Process) Restart() {
+	// CRITICAL FIX: Use a lock to prevent concurrent restarts of the same process
+	// This avoids the WaitGroup panic when multiple goroutines try to restart
+	lockKey := fmt.Sprintf("restart-%s-%d", p.name, p.id)
+	actualLock, _ := processRestartMutex.LoadOrStore(lockKey, &sync.Mutex{})
+	lock := actualLock.(*sync.Mutex)
+	
+	// Try to get the lock - if we can't, it means another goroutine is already
+	// restarting this process, so we just return
+	if !tryLock(lock) {
+		// Skip restart - already in progress
+		return
+	}
+	defer lock.Unlock()
+	
 	p.logger.Info().Msgf("process=%s status=restarting", p.name)
 	
 	// Fast path - increment restart counter with lock
@@ -195,30 +212,37 @@ func (p *Process) Restart() {
 	p.restarts++
 	p.mutex.Unlock()
 	
-	// Create a copy of the stop function to avoid potential deadlocks
-	stopped := make(chan struct{})
-	go func() {
-		p.Stop()
-		close(stopped)
-	}()
+	// BUGFIX: Set ready to false so no new commands are sent
+	p.SetReady(0)
 	
-	// Wait for stop to complete with a timeout - use timer from pool
-	timer := timerPool.Get().(*time.Timer)
-	resetTimer(timer, 2*time.Second)
-	
-	select {
-	case <-stopped:
-		// Process stopped successfully
-	case <-timer.C:
-		p.logger.Warn().Msgf("process=%s warning=stop_timeout action=restart", p.name)
+	// Kill the process directly instead of using Stop() which uses waitgroup
+	if p.cmd != nil && p.cmd.Process != nil {
+		p.cmd.Process.Kill()
 	}
 	
-	// Return timer to pool
-	timerPool.Put(timer)
+	// Close resources directly - avoid waitgroup
+	p.cleanupChannelsAndResources()
 	
 	// Only start if we're not shutting down the pool - check with atomic
 	if atomic.LoadInt32(&p.pool.shouldStop) == 0 {
 		p.Start()
+	}
+}
+
+// tryLock attempts to lock without blocking
+func tryLock(m *sync.Mutex) bool {
+	// Use a channel with timeout to avoid blocking
+	ch := make(chan bool, 1)
+	go func() {
+		m.Lock()
+		ch <- true
+	}()
+	
+	select {
+	case <-ch:
+		return true
+	case <-time.After(10 * time.Millisecond):
+		return false
 	}
 }
 
@@ -475,14 +499,11 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	// Send command to the process
 	if err := p.stdin.Encode(cmd); err != nil {
 		p.logger.Error().Err(wrapError("SendCommand", err)).Msgf("process=%s failed_to=send_command", p.name)
-		// Use timer from pool instead of sleep
-		timer := timerPool.Get().(*time.Timer)
-		resetTimer(timer, 10*time.Millisecond)
-		go func() {
-			<-timer.C
-			timerPool.Put(timer)
-			p.Restart()
-		}()
+		// Only restart for actual IO errors, not timeouts
+		if !p.IsReady() {
+			// Only restart if the process is not ready
+			go p.Restart()
+		}
 		return nil, err
 	}
 
@@ -516,14 +537,11 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	case <-timer.C:
 		p.logger.Error().Msgf("process=%s error=timeout action=communication", p.name)
 		err = &SubpError{Op: "SendCommand", Err: errors.New("communication timeout")}
-		// Use another timer from pool for restart
-		restartTimer := timerPool.Get().(*time.Timer)
-		resetTimer(restartTimer, 10*time.Millisecond)
-		go func() {
-			<-restartTimer.C
-			timerPool.Put(restartTimer)
-			p.Restart()
-		}()
+		
+		// Don't restart process for timeouts - this is causing cascading failures
+		// Only restart if there was an actual communication error
+		// With many users and 150ms renders, timeouts may happen normally
+		
 		return nil, err
 	}
 
@@ -741,68 +759,61 @@ var waitForWorkerChan = sync.Pool{
 
 // waitForWorker waits for a worker to become available with a timeout
 func (pool *ProcessPool) waitForWorker() (*Process, error) {
-	// Fast path - try to get a worker immediately
-	process := pool.tryGetWorkerFast()
-	if process != nil {
-		return process, nil
-	}
+    // Fast path - try to get a worker immediately
+    process := pool.tryGetWorkerFast()
+    if process != nil {
+        return process, nil
+    }
 
-	// Create notification channel to be informed when a worker becomes available
-	waitCh := make(chan struct{}, 1)
-	
-	// Register with the pool to be notified when workers become available
-	pool.mutex.Lock()
-	// Lazy initialize the waiters slice if needed
-	if pool.waiters == nil {
-		pool.waiters = make([]chan struct{}, 0, 8) // Pre-allocate for common case
-	}
-	pool.waiters = append(pool.waiters, waitCh)
-	pool.mutex.Unlock()
-	
-	// Cleanup on exit
-	defer func() {
-		pool.mutex.Lock()
-		// Remove our channel from the waiters list
-		for i, ch := range pool.waiters {
-			if ch == waitCh {
-				// Fast removal without preserving order
-				lastIdx := len(pool.waiters) - 1
-				pool.waiters[i] = pool.waiters[lastIdx] 
-				pool.waiters = pool.waiters[:lastIdx]
-				break
-			}
-		}
-		pool.mutex.Unlock()
-		close(waitCh)
-	}()
-
-	// Use timer from pool for timeout
-	timer := timerPool.Get().(*time.Timer)
-	resetTimer(timer, pool.workerTimeout)
-	defer timerPool.Put(timer)
-	
-	// Keep trying until timeout
-	for {
-		// Check if any worker is available right now
-		process := pool.tryGetWorkerFast()
-		if process != nil {
-			return process, nil
-		}
-
-		// Wait for either a worker notification or timeout
-		select {
-		case <-timer.C:
-			// We've timed out waiting for a worker
-			return nil, fmt.Errorf("timeout exceeded, no available workers")
-		case <-waitCh:
-			// A worker might be available, try to get it
-			process := pool.tryGetWorkerFast()
-			if process != nil {
-				return process, nil
-			}
-			// If we couldn't get the worker, continue waiting
-		}
-	}
+    // Create timer for the full timeout period that the developer specified
+    timer := timerPool.Get().(*time.Timer)
+    resetTimer(timer, pool.workerTimeout)
+    defer timerPool.Put(timer)
+    
+    // Wait loop - keep checking for workers until the timeout expires
+    // This is similar to v0.0.4 but with a fixed polling interval
+    startTime := time.Now()
+    remainingTime := pool.workerTimeout
+    
+    for remainingTime > 0 {
+        // Sleep for a short interval to avoid tight looping
+        time.Sleep(20 * time.Millisecond)
+        
+        // Always update the queue before checking for workers
+        pool.queue.mutex.Lock()
+        pool.queue.Update()
+        pool.queue.mutex.Unlock()
+        
+        // Try to get a worker
+        process = pool.tryGetWorkerFast()
+        if process != nil {
+            return process, nil
+        }
+        
+        // Update remaining time
+        elapsed := time.Since(startTime)
+        remainingTime = pool.workerTimeout - elapsed
+    }
+    
+    // Log worker status for debugging
+    pool.mutex.RLock()
+    totalWorkers := len(pool.processes)
+    readyWorkers := 0
+    busyWorkers := 0
+    for _, proc := range pool.processes {
+        if proc != nil && proc.IsReady() {
+            readyWorkers++
+            if proc.IsBusy() {
+                busyWorkers++
+            }
+        }
+    }
+    pool.mutex.RUnlock()
+    
+    pool.logger.Warn().Msgf("Timeout waiting for worker after %v: %d/%d ready, %d busy", 
+        pool.workerTimeout, readyWorkers, totalWorkers, busyWorkers)
+        
+    return nil, fmt.Errorf("timeout exceeded, no available workers")
 }
 
 // WaitForReady waits until at least one worker is ready or times out.
