@@ -239,7 +239,25 @@ func (p *Process) IsBusy() bool {
 
 // SetBusy sets the busy status of the process.
 func (p *Process) SetBusy(busy int32) {
+	prevBusy := atomic.LoadInt32(&p.isBusy)
 	atomic.StoreInt32(&p.isBusy, busy)
+	
+	// If worker is going from busy to not-busy and it's ready,
+	// notify all waiters that a worker is available
+	if prevBusy == 1 && busy == 0 && p.IsReady() {
+		p.pool.mutex.RLock()
+		if p.pool.waiters != nil {
+			for _, ch := range p.pool.waiters {
+				select {
+				case ch <- struct{}{}:
+					// Notification sent
+				default:
+					// Channel full or closed, continue to next
+				}
+			}
+		}
+		p.pool.mutex.RUnlock()
+	}
 }
 
 // readStderr reads from stderr and logs any output.
@@ -546,6 +564,7 @@ type ProcessPool struct {
 	workerTimeout time.Duration
 	comTimeout    time.Duration
 	initTimeout   time.Duration
+	waiters       []chan struct{}  // Channels to notify when workers become available
 }
 
 // NewProcessPool creates a new process pool.
@@ -722,41 +741,66 @@ var waitForWorkerChan = sync.Pool{
 
 // waitForWorker waits for a worker to become available with a timeout
 func (pool *ProcessPool) waitForWorker() (*Process, error) {
-	// Create local timer for overall timeout
-	timeoutTimer := timerPool.Get().(*time.Timer)
-	resetTimer(timeoutTimer, pool.workerTimeout)
-	defer timerPool.Put(timeoutTimer)
+	// Fast path - try to get a worker immediately
+	process := pool.tryGetWorkerFast()
+	if process != nil {
+		return process, nil
+	}
+
+	// Create notification channel to be informed when a worker becomes available
+	waitCh := make(chan struct{}, 1)
 	
-	// Start time for metrics
-	startTime := time.Now()
+	// Register with the pool to be notified when workers become available
+	pool.mutex.Lock()
+	// Lazy initialize the waiters slice if needed
+	if pool.waiters == nil {
+		pool.waiters = make([]chan struct{}, 0, 8) // Pre-allocate for common case
+	}
+	pool.waiters = append(pool.waiters, waitCh)
+	pool.mutex.Unlock()
 	
-	// Use a more efficient polling approach with exponential backoff
-	backoff := 100 * time.Microsecond // Start with smaller initial backoff
-	maxBackoff := 10 * time.Millisecond // Smaller max backoff for higher responsiveness
+	// Cleanup on exit
+	defer func() {
+		pool.mutex.Lock()
+		// Remove our channel from the waiters list
+		for i, ch := range pool.waiters {
+			if ch == waitCh {
+				// Fast removal without preserving order
+				lastIdx := len(pool.waiters) - 1
+				pool.waiters[i] = pool.waiters[lastIdx] 
+				pool.waiters = pool.waiters[:lastIdx]
+				break
+			}
+		}
+		pool.mutex.Unlock()
+		close(waitCh)
+	}()
+
+	// Use timer from pool for timeout
+	timer := timerPool.Get().(*time.Timer)
+	resetTimer(timer, pool.workerTimeout)
+	defer timerPool.Put(timer)
 	
+	// Keep trying until timeout
 	for {
-		// Try to get a worker - optimized fastest path
+		// Check if any worker is available right now
 		process := pool.tryGetWorkerFast()
 		if process != nil {
 			return process, nil
 		}
-		
-		// Check if we've hit the timeout
-		if time.Since(startTime) >= pool.workerTimeout {
-			return nil, fmt.Errorf("timeout exceeded, no available workers")
-		}
-		
-		// If we haven't timed out yet, wait using backoff strategy
-		// Use the timer channel directly for efficiency
+
+		// Wait for either a worker notification or timeout
 		select {
-		case <-timeoutTimer.C:
+		case <-timer.C:
+			// We've timed out waiting for a worker
 			return nil, fmt.Errorf("timeout exceeded, no available workers")
-		case <-time.After(backoff):
-			// Increase backoff duration exponentially with a cap
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
+		case <-waitCh:
+			// A worker might be available, try to get it
+			process := pool.tryGetWorkerFast()
+			if process != nil {
+				return process, nil
 			}
+			// If we couldn't get the worker, continue waiting
 		}
 	}
 }
