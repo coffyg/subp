@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"os/exec"
 	"strings"
 	"sync"
@@ -17,6 +18,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
+
+// responsePool is a pool of pre-allocated response maps to reduce GC pressure
+var responsePool = sync.Pool{
+	New: func() interface{} {
+		return make(map[string]interface{}, 16) // Pre-allocate with reasonable capacity
+	},
+}
 
 // Process is a process that can be started, stopped, and restarted.
 type Process struct {
@@ -204,39 +212,81 @@ func (p *Process) readStderr() {
 
 // WaitForReadyScan waits for the process to send a "ready" message.
 func (p *Process) WaitForReadyScan() {
+	// Pre-allocate a ready message flag
+	const readyMsg = "ready"
+	
+	// Use a progressively increasing backoff for EOF errors
+	backoff := 1 * time.Millisecond
+	maxBackoff := 50 * time.Millisecond
+	
 	for {
-		p.mutex.Lock()
+		p.mutex.RLock() // Use RLock for initial check
 		stdout := p.stdout
 		if stdout == nil {
+			p.mutex.RUnlock()
+			return
+		}
+		p.mutex.RUnlock()
+		
+		// Now get exclusive lock only for the actual read operation
+		p.mutex.Lock()
+		if p.stdout == nil { // Double-check after exclusive lock
 			p.mutex.Unlock()
 			return
 		}
-		line, err := stdout.ReadString('\n')
+		line, err := p.stdout.ReadString('\n')
 		p.mutex.Unlock()
+		
 		if err != nil {
 			if err != io.EOF {
 				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
 				p.Restart()
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
+			// Use exponential backoff with jitter for EOF errors
+			sleepTime := backoff + time.Duration(int64(float64(backoff)*0.2*rand.Float64()))
+			time.Sleep(sleepTime)
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
 			continue
 		}
+		
+		// Reset backoff on successful reads
+		backoff = 1 * time.Millisecond
+		
 		if line == "" || line == "\n" {
 			continue
 		}
-		var response map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &response); err != nil {
+		
+		// Get a pre-allocated response map from the pool
+		responseMap := responsePool.Get().(map[string]interface{})
+		// Clear the map for reuse
+		for k := range responseMap {
+			delete(responseMap, k)
+		}
+		
+		if err := json.Unmarshal([]byte(line), &responseMap); err != nil {
+			// Return the map to the pool if unmarshaling fails
+			responsePool.Put(responseMap)
+			
 			// Format non-JSON messages more clearly
 			trimmedLine := strings.TrimSpace(line)
 			p.logger.Info().Msgf("[nyxsub|%s|stdout] Non-JSON output: %s", p.name, trimmedLine)
 			continue
 		}
-		if typeVal, ok := response["type"]; ok && typeVal == "ready" {
+		
+		if typeVal, ok := responseMap["type"]; ok && typeVal == readyMsg {
 			p.logger.Info().Msgf("[nyxsub|%s] Process is ready", p.name)
 			p.SetReady(1)
+			// Return the map to the pool before returning
+			responsePool.Put(responseMap)
 			return
 		}
+		
+		// Return the map to the pool if it's not a ready message
+		responsePool.Put(responseMap)
 	}
 }
 
@@ -326,8 +376,18 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 				time.Sleep(1 * time.Millisecond)
 				continue
 			}
-			var response map[string]interface{}
-			if err := json.Unmarshal([]byte(line), &response); err != nil {
+			
+			// Get a pre-allocated response map from the pool
+			responseMap := responsePool.Get().(map[string]interface{})
+			// Clear the map for reuse
+			for k := range responseMap {
+				delete(responseMap, k)
+			}
+			
+			if err := json.Unmarshal([]byte(line), &responseMap); err != nil {
+				// Return the map to the pool if unmarshaling fails
+				responsePool.Put(responseMap)
+				
 				// Format non-JSON messages more clearly - using Info level since
 				// non-JSON output from subprocess is often informational, not a warning
 				trimmedLine := strings.TrimSpace(line)
@@ -335,9 +395,21 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 				continue
 			}
 
-			if id, ok := response["id"]; ok && id == cmdID {
-				return response, nil
+			if id, ok := responseMap["id"]; ok && id == cmdID {
+				// Create a copy to return since we can't return the pooled object directly
+				// (it would be reused while the caller is still using it)
+				result := make(map[string]interface{}, len(responseMap))
+				for k, v := range responseMap {
+					result[k] = v
+				}
+				
+				// Return the original map to the pool
+				responsePool.Put(responseMap)
+				return result, nil
 			}
+			
+			// Return the map to the pool if it doesn't match our cmdID
+			responsePool.Put(responseMap)
 		}
 	}
 }
@@ -443,21 +515,40 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 	return exports
 }
 
+// processWithPrioPool is a pool of pre-allocated ProcessWithPrio objects
+var processWithPrioPool = sync.Pool{
+	New: func() interface{} {
+		return &ProcessWithPrio{}
+	},
+}
+
 // GetWorker returns a worker process from the process pool.
 func (pool *ProcessPool) GetWorker() (*Process, error) {
 	if atomic.LoadInt32(&pool.shouldStop) == 1 {
 		return nil, fmt.Errorf("process pool is stopping")
 	}
 
-	timeout := time.After(pool.workerTimeout)
-	ticker := time.NewTicker(5 * time.Millisecond)
+	// Use adaptive polling strategy - start with shorter intervals, then increase
+	initialInterval := 1 * time.Millisecond
+	maxInterval := 20 * time.Millisecond
+	currentInterval := initialInterval
+	
+	// Create a ticker with the initial interval
+	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
-
+	
+	// Create a timeout channel
+	timeout := time.After(pool.workerTimeout)
+	
+	// Create a variable to track consecutive attempts with no ready workers
+	noReadyCount := 0
+	
 	for {
 		select {
 		case <-timeout:
 			return nil, fmt.Errorf("timeout exceeded, no available workers")
 		case <-ticker.C:
+			// Quickly check if any workers are ready before taking locks
 			anyReady := false
 			pool.mutex.RLock()
 			for _, process := range pool.processes {
@@ -467,18 +558,46 @@ func (pool *ProcessPool) GetWorker() (*Process, error) {
 				}
 			}
 			pool.mutex.RUnlock()
+			
 			if !anyReady {
+				// Adjust polling interval based on consecutive failures
+				noReadyCount++
+				if noReadyCount > 5 && currentInterval < maxInterval {
+					// Increase interval exponentially
+					currentInterval *= 2
+					if currentInterval > maxInterval {
+						currentInterval = maxInterval
+					}
+					// Reset the ticker with the new interval
+					ticker.Reset(currentInterval)
+				}
 				continue
 			}
+			
+			// We found a ready worker, reset the count and interval
+			noReadyCount = 0
+			if currentInterval != initialInterval {
+				currentInterval = initialInterval
+				ticker.Reset(currentInterval)
+			}
+			
+			// Now update the queue and get the next available worker
 			pool.queue.mutex.Lock()
 			pool.queue.Update()
 			if pool.queue.Len() > 0 {
 				processWithPrio := heap.Pop(&pool.queue).(*ProcessWithPrio)
 				pid := processWithPrio.processId
+				
+				// Return the ProcessWithPrio object to the pool
+				processWithPrioPool.Put(processWithPrio)
+				
 				pool.queue.mutex.Unlock()
+				
+				// Try to get and mark the worker as busy
 				pool.mutex.RLock()
 				process := pool.processes[pid]
 				pool.mutex.RUnlock()
+				
 				if process != nil && atomic.LoadInt32(&process.isReady) == 1 && atomic.CompareAndSwapInt32(&process.isBusy, 0, 1) {
 					return process, nil
 				}
@@ -568,22 +687,54 @@ func (pq *ProcessPQ) Pop() interface{} {
 	n := len(old)
 	item := old[n-1]
 	pq.processes = old[0 : n-1]
+	// Note: we don't return the item to the pool here because GetWorker
+	// needs to use its values before returning it to the pool
 	return item
 }
 
 func (pq *ProcessPQ) Update() {
-	pq.processes = pq.processes[:0]
+	// Reuse the existing slice but clear it
+	if cap(pq.processes) > 0 {
+		pq.processes = pq.processes[:0]
+	} else {
+		// Allocate with capacity if it's the first run
+		pq.processes = make([]*ProcessWithPrio, 0, len(pq.pool.processes))
+	}
+	
 	pq.pool.mutex.RLock()
+	var readyCount int
+	// First pass: count ready processes to optimize allocation
 	for _, process := range pq.pool.processes {
 		if process != nil && atomic.LoadInt32(&process.isReady) == 1 && atomic.LoadInt32(&process.isBusy) == 0 {
+			readyCount++
+		}
+	}
+	
+	// Ensure capacity
+	if cap(pq.processes) < readyCount {
+		// Create a new slice with larger capacity
+		newProcesses := make([]*ProcessWithPrio, 0, readyCount)
+		pq.processes = newProcesses
+	}
+	
+	// Second pass: collect the ready processes
+	for _, process := range pq.pool.processes {
+		if process != nil && atomic.LoadInt32(&process.isReady) == 1 && atomic.LoadInt32(&process.isBusy) == 0 {
+			// Get a ProcessWithPrio from the pool
+			pwp := processWithPrioPool.Get().(*ProcessWithPrio)
+			
 			process.mutex.RLock()
-			pq.processes = append(pq.processes, &ProcessWithPrio{
-				processId: process.id,
-				handled:   process.requestsHandled,
-			})
+			pwp.processId = process.id
+			pwp.handled = process.requestsHandled
 			process.mutex.RUnlock()
+			
+			pq.processes = append(pq.processes, pwp)
 		}
 	}
 	pq.pool.mutex.RUnlock()
-	heap.Init(pq)
+	
+	// Only initialize the heap if we found ready processes
+	if len(pq.processes) > 0 {
+		heap.Init(pq)
+	}
 }
