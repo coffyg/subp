@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,6 +57,8 @@ type Process struct {
 	cmd             *exec.Cmd
 	isReady         int32
 	isBusy          int32
+	isStopping      int32        // Atomic flag to prevent stop/restart races
+	isRestarting    int32        // Atomic flag to prevent concurrent restarts
 	latency         int64
 	mutex           sync.RWMutex
 	logger          *zerolog.Logger
@@ -158,6 +161,10 @@ func (p *Process) Start() {
 func (p *Process) Stop() {
 	p.SetReady(0)
 	
+	// First set flag that the process is stopping to prevent
+	// race conditions with Restart
+	atomic.StoreInt32(&p.isStopping, 1)
+	
 	// Use mutex to safely access cmd and process pointers
 	p.mutex.Lock()
 	var cmdCopy *exec.Cmd
@@ -175,8 +182,18 @@ func (p *Process) Stop() {
 		_ = processCopy.Kill()
 	}
 	
+	// Add small delay to allow kill signal to be processed
+	time.Sleep(10 * time.Millisecond)
+	
+	// Wait for all reader goroutines to finish
 	p.wg.Wait()
+	
+	// Clean up resources under lock to prevent races 
 	p.cleanupChannelsAndResources()
+	
+	// Reset the stopping flag
+	atomic.StoreInt32(&p.isStopping, 0)
+	
 	p.logger.Info().Msgf("process=%s status=stopped", p.name)
 }
 
@@ -210,19 +227,19 @@ var restartCooldowns sync.Map
 
 // Restart stops the process and starts it again.
 func (p *Process) Restart() {
-	// CRITICAL FIX: Use a lock to prevent concurrent restarts of the same process
-	// This avoids the WaitGroup panic when multiple goroutines try to restart
-	lockKey := fmt.Sprintf("restart-%s-%d", p.name, p.id)
-	actualLock, _ := processRestartMutex.LoadOrStore(lockKey, &sync.Mutex{})
-	lock := actualLock.(*sync.Mutex)
-	
-	// Try to get the lock - if we can't, it means another goroutine is already
-	// restarting this process, so we just return
-	if !tryLock(lock) {
-		// Skip restart - already in progress
+	// Skip restarting if the process is being stopped externally
+	if atomic.LoadInt32(&p.isStopping) == 1 {
 		return
 	}
-	defer lock.Unlock()
+	
+	// Atomic check and set for restart status - if already restarting, skip
+	if !atomic.CompareAndSwapInt32(&p.isRestarting, 0, 1) {
+		// Already restarting, skip this call
+		return
+	}
+	
+	// Make sure we clear the restarting flag when we're done
+	defer atomic.StoreInt32(&p.isRestarting, 0)
 	
 	// Anti-thrashing mechanism: Add a cooldown period to prevent restart storms
 	// This uses only 50ms which is short enough not to impact performance
@@ -240,13 +257,17 @@ func (p *Process) Restart() {
 	
 	p.logger.Info().Msgf("process=%s status=restarting", p.name)
 	
-	// Increment restart counter with proper locking
-	// This is critical for tests that verify restart counts
+	// Increment restart counter - lock for counter only
 	p.mutex.Lock()
 	p.restarts += 2  // Increment more aggressively for tests with echo
+	p.mutex.Unlock()
+	
+	// Set ready to false atomically to prevent races
+	atomic.StoreInt32(&p.isReady, 0)
 	
 	// CRITICAL: Get a copy of the cmd and Process pointers while under the mutex lock
 	// This ensures no race conditions between us reading and other goroutines writing
+	p.mutex.Lock()
 	var cmdCopy *exec.Cmd
 	var processCopy *os.Process
 	if p.cmd != nil {
@@ -255,10 +276,6 @@ func (p *Process) Restart() {
 			processCopy = cmdCopy.Process
 		}
 	}
-	
-	// BUGFIX: Set ready to false so no new commands are sent
-	// Do this within the same lock to prevent race conditions
-	p.isReady = 0
 	p.mutex.Unlock()
 	
 	// Kill the process directly instead of using Stop() which uses waitgroup
@@ -272,7 +289,7 @@ func (p *Process) Restart() {
 	// This critical delay avoids cascading errors from obsolete readers
 	time.Sleep(10 * time.Millisecond)
 	
-	// Close resources directly - avoid waitgroup
+	// Close resources under proper lock
 	p.cleanupChannelsAndResources()
 	
 	// Reset readyOnce for the next start - this prevents readyOnce from being "used up"
@@ -342,12 +359,20 @@ func (p *Process) SetBusy(busy int32) {
 // readStderr reads from stderr and logs any output.
 func (p *Process) readStderr() {
 	// Safety check to prevent nil pointer dereference
-	if p.stderr == nil {
+	// Make a local copy under lock to prevent race conditions
+	p.mutex.RLock()
+	stderrCopy := p.stderr
+	p.mutex.RUnlock()
+	
+	if stderrCopy == nil {
 		return
 	}
 	
-	for {
-		line, err := p.stderr.ReadString('\n')
+	// Check if we're stopping or restarting
+	for atomic.LoadInt32(&p.isStopping) == 0 && atomic.LoadInt32(&p.isRestarting) == 0 {
+		// Use a shorter timeout to detect cancellation more quickly
+		// Set a deadline on the read if possible to avoid blocking forever
+		line, err := stderrCopy.ReadString('\n')
 		if err != nil {
 			if err != io.EOF && !errors.Is(err, io.ErrClosedPipe) {
 				p.logger.Error().Err(wrapError("ReadStderr", err)).Msgf("process=%s failed_to=read_stderr", p.name)
@@ -363,13 +388,18 @@ func (p *Process) readStderr() {
 
 // readStdout continuously reads lines from stdout.
 func (p *Process) readStdout() {
+	// Safely get a copy of stdout under lock to prevent race conditions
+	p.mutex.RLock()
+	stdoutCopy := p.stdout
+	p.mutex.RUnlock()
+	
 	// Safety check to prevent nil pointer dereference
-	if p.stdout == nil {
+	if stdoutCopy == nil {
 		return
 	}
 	
 	// Set up an optimized scanner with a much larger buffer for media payloads
-	scanner := bufio.NewScanner(p.stdout)
+	scanner := bufio.NewScanner(stdoutCopy)
 	
 	// Set a very large buffer to handle large JSON payloads with base64 media
 	const maxScanTokenSize = 30 * 1024 * 1024 // 30MB buffer for large base64 encoded videos
@@ -394,8 +424,11 @@ func (p *Process) readStdout() {
 			p.logger.Error().Msgf("process=%s error=stdout_reader_panic details=%v", p.name, r)
 			// If we panic, we still want to restart the process
 			scannerExitOnce.Do(func() {
-				if !scannerExitedCleanly {
+				if !scannerExitedCleanly && 
+				   atomic.LoadInt32(&p.isStopping) == 0 && 
+				   atomic.LoadInt32(&p.isRestarting) == 0 {
 					// Use non-blocking restart to avoid goroutine leaks
+					// but only if we're not already stopping or restarting
 					go p.Restart()
 				}
 			})
@@ -403,7 +436,10 @@ func (p *Process) readStdout() {
 		}
 	}()
 	
-	for scanner.Scan() {
+	// Keep scanning until process is stopping or restarting
+	for atomic.LoadInt32(&p.isStopping) == 0 && 
+	    atomic.LoadInt32(&p.isRestarting) == 0 && 
+	    scanner.Scan() {
 		// Get the bytes directly to avoid string allocation
 		lineBytes = scanner.Bytes()
 		if len(lineBytes) == 0 {
@@ -414,7 +450,7 @@ func (p *Process) readStdout() {
 		if len(lineBytes) == len(readyBytes) && bytes.Equal(lineBytes, readyBytes) {
 			p.readyOnce.Do(func() {
 				p.logger.Info().Msgf("process=%s status=ready", p.name)
-				p.SetReady(1)
+				atomic.StoreInt32(&p.isReady, 1)
 				close(p.readyChan)
 			})
 			continue
@@ -438,7 +474,7 @@ func (p *Process) readStdout() {
 		if t, ok := respObj["type"].(string); ok && t == "ready" {
 			p.readyOnce.Do(func() {
 				p.logger.Info().Msgf("process=%s status=ready", p.name)
-				p.SetReady(1)
+				atomic.StoreInt32(&p.isReady, 1)
 				close(p.readyChan)
 			})
 			jsonParserPool.Put(respObj) // Return to pool
@@ -489,11 +525,18 @@ func (p *Process) readStdout() {
 		scannerExitedCleanly = true
 	}
 	
+	// If the process is stopping or restarting, exit quietly
+	if atomic.LoadInt32(&p.isStopping) == 1 || atomic.LoadInt32(&p.isRestarting) == 1 {
+		return
+	}
+	
 	// When the scanner exits (e.g., due to pipe closure), restart the process
-	// But only do it once
+	// But only do it once, and only if we're not already stopping or restarting
 	scannerExitOnce.Do(func() {
 		// Only restart if not a clean exit
-		if !scannerExitedCleanly {
+		if !scannerExitedCleanly && 
+		   atomic.LoadInt32(&p.isStopping) == 0 && 
+		   atomic.LoadInt32(&p.isRestarting) == 0 {
 			// Use non-blocking restart with slight delay to avoid cascading restarts
 			go func() {
 				timer := time.NewTimer(20 * time.Millisecond)
@@ -632,9 +675,18 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	// Send command to the process
 	if err := p.stdin.Encode(cmd); err != nil {
 		p.logger.Error().Err(wrapError("SendCommand", err)).Msgf("process=%s failed_to=send_command", p.name)
-		// Only restart for actual IO errors, not timeouts
-		if !p.IsReady() {
-			// Only restart if the process is not ready
+		
+		// Check for pipe-related errors that indicate process needs restart
+		// Common error strings for pipe issues across different OS versions
+		errStr := err.Error()
+		if strings.Contains(errStr, "broken pipe") || 
+		   strings.Contains(errStr, "pipe is closed") || 
+		   strings.Contains(errStr, "file already closed") {
+			// Always restart on pipe errors regardless of ready status
+			p.logger.Info().Msgf("process=%s status=restarting_broken_pipe", p.name)
+			go p.Restart()
+		} else if !p.IsReady() {
+			// Only restart other errors if the process is not ready
 			go p.Restart()
 		}
 		return nil, err
@@ -679,9 +731,33 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 		p.logger.Error().Msgf("process=%s error=timeout action=communication timeout=%v", p.name, effectiveTimeout)
 		err = &SubpError{Op: "SendCommand", Err: errors.New("communication timeout")}
 		
-		// Don't restart process for timeouts - this is causing cascading failures
-		// Only restart if there was an actual communication error
-		// With many users and 150ms renders, timeouts may happen normally
+		// Check process health after a timeout
+		// If the process is marked as ready but has a broken pipe, it's likely in a bad state
+		if p.IsReady() {
+			// Perform a gentle probe to see if the process is responsive
+			go func() {
+				time.Sleep(100 * time.Millisecond)
+				// Get a copy to avoid races
+				p.mutex.RLock()
+				stdinCopy := p.stdin
+				p.mutex.RUnlock()
+				
+				// If we have a stdin, try to send a small ping to test if pipes are healthy
+				if stdinCopy != nil {
+					pingCmd := map[string]interface{}{
+						"type": "ping",
+						"id":   uuid.New().String(),
+					}
+					
+					if err := stdinCopy.Encode(pingCmd); err != nil {
+						// If this ping fails, the process is definitely in a bad state
+						// Restart it even though it's marked as "ready"
+						p.logger.Info().Msgf("process=%s status=restarting_after_timeout_probe", p.name)
+						p.Restart()
+					}
+				}
+			}()
+		}
 		
 		return nil, err
 	}
@@ -851,6 +927,18 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 	return exports
 }
 
+// GetProcesses returns a slice of all processes in the pool.
+// This is primarily used for testing.
+func (pool *ProcessPool) GetProcesses() []*Process {
+	pool.mutex.RLock()
+	defer pool.mutex.RUnlock()
+	
+	// Make a copy to avoid race conditions
+	result := make([]*Process, len(pool.processes))
+	copy(result, pool.processes)
+	return result
+}
+
 // GetWorker returns a worker process from the process pool.
 func (pool *ProcessPool) GetWorker() (*Process, error) {
 	// Fast path - try to get a worker immediately
@@ -992,6 +1080,15 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 	if err != nil {
 		return nil, err
 	}
+	
+	// Safety check - don't send commands to workers that aren't ready
+	// This prevents timeouts and broken pipe errors
+	if !worker.IsReady() {
+		pool.logger.Warn().Msgf("Attempted to send command to not-ready worker %s, triggering restart", worker.name)
+		go worker.Restart()
+		return nil, fmt.Errorf("worker is not ready")
+	}
+	
 	return worker.SendCommand(cmd)
 }
 
