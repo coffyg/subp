@@ -208,16 +208,21 @@ func (p *Process) readStderr() {
 // WaitForReadyScan waits for the process to send a "ready" message.
 func (p *Process) WaitForReadyScan() {
 	for {
-		p.mutex.RLock()
-		stdout := p.stdout
-		p.mutex.RUnlock()
+		// Use a longer lock to protect the entire read operation
+		// This prevents concurrent access to the same bufio.Reader
+		p.mutex.Lock()
 		
 		// Check if stdout is nil (could happen during restart)
+		stdout := p.stdout
 		if stdout == nil {
+			p.mutex.Unlock()
 			return
 		}
 		
+		// Read from stdout while holding the lock
 		line, err := stdout.ReadString('\n')
+		p.mutex.Unlock()
+		
 		if err != nil {
 			p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
 			p.Restart()
@@ -255,22 +260,21 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 	start := time.Now().UnixMilli()
 
-	// Access stdin with mutex protection
-	p.mutex.RLock()
-	stdin := p.stdin
-	p.mutex.RUnlock()
+	// Use a longer lock to protect the entire write operation
+	// This prevents concurrent access to the same json.Encoder
+	p.mutex.Lock()
 	
 	// Check if stdin is nil (could happen during restart)
-	if stdin == nil {
+	if p.stdin == nil {
+		p.mutex.Unlock()
 		p.logger.Error().Msgf("[nyxsub|%s] stdin is nil", p.name)
 		p.Restart()
 		return nil, errors.New("stdin is nil")
 	}
 	
 	// Send command with mutex protection to prevent races
-	p.mutex.RLock()
 	err := p.stdin.Encode(cmd)
-	p.mutex.RUnlock()
+	p.mutex.Unlock()
 	
 	if err != nil {
 		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to send command", p.name)
@@ -307,17 +311,21 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 			p.logger.Error().Msgf("[nyxsub|%s] Communication timed out", p.name)
 			return nil, errors.New("communication timed out")
 		default:
-			// Access stdout with mutex protection
-			p.mutex.RLock()
-			stdout := p.stdout
-			p.mutex.RUnlock()
+			// Use a longer lock to protect the entire read operation
+			// This prevents concurrent access to the same bufio.Reader
+			p.mutex.Lock()
 			
 			// Check if stdout is nil (could happen during restart)
+			stdout := p.stdout
 			if stdout == nil {
+				p.mutex.Unlock()
 				return nil, errors.New("stdout is nil")
 			}
 			
+			// Read from stdout while holding the lock
 			line, err := stdout.ReadString('\n')
+			p.mutex.Unlock()
+			
 			if err != nil {
 				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
 				return nil, err
