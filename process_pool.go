@@ -4,6 +4,7 @@ package subp
 import (
 	"bufio"
 	"container/heap"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,7 +16,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
 
@@ -47,6 +47,15 @@ var uuidPool = sync.Pool{
 		return make([]byte, 36) // UUID string length
 	},
 }
+
+// commandIDCounter is an atomic counter for generating sequential command IDs
+var commandIDCounter uint64
+
+// commandIDMutex protects the buffer during ID generation
+var commandIDMutex sync.Mutex
+
+// commandIDBuffer is a pre-allocated buffer for generating command IDs
+var commandIDBuffer [16]byte
 
 // Process is a process that can be started, stopped, and restarted.
 type Process struct {
@@ -357,15 +366,20 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	
 	var cmdID string
 	if id, ok := cmd["id"]; !ok {
-		// Generate UUID with less allocations by using the UUID pool
-		uuidBuf := uuidPool.Get().([]byte)
-		// Write the UUID string directly into the pre-allocated buffer
-		uuidStr := uuid.New().String()
-		copy(uuidBuf, uuidStr)
-		cmdID = string(uuidBuf[:36])
+		// Use a faster sequential ID generation instead of UUID
+		commandIDMutex.Lock()
+		// Increment the counter atomically
+		counter := atomic.AddUint64(&commandIDCounter, 1)
+		// Fill buffer with timestamp and counter for uniqueness
+		binary.BigEndian.PutUint64(commandIDBuffer[0:8], uint64(time.Now().UnixNano()))
+		binary.BigEndian.PutUint64(commandIDBuffer[8:16], counter)
+		// Format directly as hex without intermediate allocations
+		cmdID = fmt.Sprintf("%x-%x-%x-%x-%x", 
+			commandIDBuffer[0:4], commandIDBuffer[4:6], 
+			commandIDBuffer[6:8], commandIDBuffer[8:10], 
+			commandIDBuffer[10:16])
+		commandIDMutex.Unlock()
 		cmd["id"] = cmdID
-		// Return the buffer to the pool
-		uuidPool.Put(uuidBuf)
 	} else {
 		cmdID = id.(string)
 	}
