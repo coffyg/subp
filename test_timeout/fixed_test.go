@@ -1,15 +1,10 @@
-package main
+package timeout
 
 import (
 	"fmt"
-	"os"
-	"time"
-
-	"github.com/fy/coffyg/subp"
-	"github.com/rs/zerolog"
 )
 
-func main() {
+func RunFixedTest() {
 	// Recommended fixes for your SSR application:
 	
 	fmt.Println("=== RECOMMENDATIONS FOR FIXING YOUR SSR TIMEOUTS ===")
@@ -37,22 +32,20 @@ func main() {
 	fmt.Println("   - After SendCommand returns, make sure SetBusy(0) is called")
 	fmt.Println()
 	
-	// Create a simplified test to demonstrate how timeouts and pool size affect behavior
-	logger := zerolog.New(os.Stderr).With().Timestamp().Logger()
-	
 	// Create a faster pool for comparison
 	fmt.Println("--- TESTING WITH RECOMMENDED SETTINGS ---")
-	pool := subp.NewProcessPool(
-		"optimized_ssr",
-		8,                   // Double the workers
-		&logger,
-		".",
-		"./test_worker",      // Use the same test worker from the previous test
-		[]string{},
-		2*time.Second,       // Longer worker timeout
-		2*time.Second,       // Longer communication timeout
-		5*time.Second,       // Same init timeout
-	)
+	fmt.Println("Example configuration:")
+	fmt.Println(`  pool := subp.NewProcessPool(
+    "optimized_ssr",
+    8,                   // Double the workers
+    &logger,
+    ".",
+    "./test_worker",     // Use the same test worker
+    []string{},
+    2*time.Second,       // Longer worker timeout
+    2*time.Second,       // Longer communication timeout
+    5*time.Second,       // Same init timeout
+  )`)
 	
 	fmt.Println("Running test with improved configuration...")
 	fmt.Println("(This would require the same test worker as the previous test)")

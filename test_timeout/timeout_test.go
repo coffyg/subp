@@ -1,4 +1,4 @@
-package main
+package timeout
 
 import (
 	"fmt"
@@ -11,7 +11,7 @@ import (
 	"github.com/fy/coffyg/subp"
 )
 
-func main() {
+func RunTimeoutTest() {
 	// Set up logging
 	logger := zerolog.New(os.Stderr).With().Timestamp().Logger()
 
@@ -27,7 +27,7 @@ import (
 	"time"
 )
 
-func main() {
+func RunTimeoutTest() {
 	// Signal that we're ready
 	json.NewEncoder(os.Stdout).Encode(map[string]interface{}{"type": "ready"})
 	
