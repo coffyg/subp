@@ -46,6 +46,11 @@ if [ "$RUN_BENCHMARKS" = true ]; then
     # Remove any existing benchmark files
     rm -f process_pool_bench_template.go process_pool_bench_test.go
     
+    # Temporarily rename the original benchmark file to avoid name conflicts
+    if [ -f "process_pool_benchmark_test.go" ]; then
+        mv process_pool_benchmark_test.go process_pool_benchmark_test.go.bak
+    fi
+    
     # Create a simplified benchmark file that just tests GetWorker
     cat > process_pool_bench_test.go << 'EOF'
 package subp
@@ -225,6 +230,11 @@ EOF
     # Clean up
     echo -e "\n${YELLOW}Cleaning up benchmark files...${NC}"
     rm -f process_pool_bench_test.go
+    
+    # Restore the original benchmark file if it was backed up
+    if [ -f "process_pool_benchmark_test.go.bak" ]; then
+        mv process_pool_benchmark_test.go.bak process_pool_benchmark_test.go
+    fi
 else
     echo -e "${YELLOW}To run benchmarks, use:${NC} ./bench.sh --run"
 fi
