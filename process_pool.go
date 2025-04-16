@@ -257,16 +257,36 @@ func (p *Process) WaitForReadyScan() {
 	backoff := 1 * time.Millisecond
 	maxBackoff := 50 * time.Millisecond
 	
+	// Get a buffer for line reading from the pool
+	bufPtr := lineBufferPool.Get().(*[]byte)
+	// Clear but keep capacity
+	*bufPtr = (*bufPtr)[:0] 
+	defer lineBufferPool.Put(bufPtr)
+	
+	// Setup timeout for initialization
+	initTimeout := time.After(p.initTimeout)
+	
+	// Get the stdout reader once outside the loop
+	p.mutex.RLock()
+	stdout := p.stdout
+	p.mutex.RUnlock()
+	
+	if stdout == nil {
+		return
+	}
+	
 	for {
-		p.mutex.RLock() // Use RLock for initial check
-		stdout := p.stdout
-		if stdout == nil {
-			p.mutex.RUnlock()
+		select {
+		case <-initTimeout:
+			// Timeout waiting for ready message
+			p.logger.Error().Msgf("[nyxsub|%s] Timeout waiting for ready message", p.name)
+			p.Restart()
 			return
+		default:
+			// Continue with normal processing
 		}
-		p.mutex.RUnlock()
 		
-		// Now get exclusive lock only for the actual read operation
+		// Very short, exclusive lock only for the actual read operation
 		p.mutex.Lock()
 		if p.stdout == nil { // Double-check after exclusive lock
 			p.mutex.Unlock()
@@ -282,7 +302,8 @@ func (p *Process) WaitForReadyScan() {
 				return
 			}
 			// Use exponential backoff with jitter for EOF errors
-			sleepTime := backoff + time.Duration(int64(float64(backoff)*0.2*rand.Float64()))
+			jitter := time.Duration(rand.Int63n(int64(backoff) / 5))
+			sleepTime := backoff + jitter
 			time.Sleep(sleepTime)
 			backoff *= 2
 			if backoff > maxBackoff {
@@ -300,10 +321,8 @@ func (p *Process) WaitForReadyScan() {
 		
 		// Get a pre-allocated response map from the pool
 		responseMap := responsePool.Get().(map[string]interface{})
-		// Clear the map for reuse
-		for k := range responseMap {
-			delete(responseMap, k)
-		}
+		// Clear the map for reuse using our optimized function
+		fastClearMap(responseMap)
 		
 		if err := json.Unmarshal([]byte(line), &responseMap); err != nil {
 			// Return the map to the pool if unmarshaling fails
@@ -397,10 +416,28 @@ func fastClearMap(m map[string]interface{}) {
 	}
 }
 
+// lineBufferPool is a pool of pre-allocated byte slices for reading lines
+var lineBufferPool = sync.Pool{
+	New: func() interface{} {
+		// Pre-allocate a 4KB buffer, which is enough for most JSON responses
+		buffer := make([]byte, 0, 4096)
+		return &buffer
+	},
+}
+
 func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 	timeout := time.After(p.timeout)
 	
-	// Read stdout under read lock to avoid contention
+	// Get a buffer for line reading from the pool
+	bufPtr := lineBufferPool.Get().(*[]byte)
+	// Clear but keep capacity
+	*bufPtr = (*bufPtr)[:0] 
+	defer lineBufferPool.Put(bufPtr)
+	
+	// Pre-allocate the result map once outside the loop to avoid repeated allocations
+	result := make(map[string]interface{}, 16)
+	
+	// Get the stdout reader once outside the loop
 	p.mutex.RLock()
 	stdout := p.stdout
 	p.mutex.RUnlock()
@@ -408,9 +445,6 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 	if stdout == nil {
 		return nil, errors.New("stdout is nil")
 	}
-	
-	// Pre-allocate the result map once outside the loop to avoid repeated allocations
-	result := make(map[string]interface{}, 16)
 
 	for {
 		select {
@@ -418,6 +452,7 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 			p.logger.Error().Msgf("[nyxsub|%s] Communication timed out", p.name)
 			return nil, errors.New("communication timed out")
 		default:
+			// Very short, exclusive lock only for the actual read operation
 			p.mutex.Lock()
 			if p.stdout == nil {
 				p.mutex.Unlock()
@@ -425,10 +460,12 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 			}
 			line, err := p.stdout.ReadString('\n')
 			p.mutex.Unlock()
+			
 			if err != nil {
 				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
 				return nil, err
 			}
+			
 			if line == "" || line == "\n" {
 				time.Sleep(1 * time.Millisecond)
 				continue
