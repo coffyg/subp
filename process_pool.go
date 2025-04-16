@@ -138,11 +138,24 @@ func (p *Process) cleanupChannelsAndResources() {
 // Restart stops the process and starts it again.
 func (p *Process) Restart() {
 	p.logger.Info().Msgf("[nyxsub|%s] Restarting process", p.name)
+	
+	// Increment restart counter
 	p.mutex.Lock()
 	p.restarts++
 	p.mutex.Unlock()
+	
+	// Stop the current process
 	p.Stop()
+	
+	// Only start if the pool is not being shut down
 	if atomic.LoadInt32(&p.pool.shouldStop) == 0 {
+		// Reset state before starting
+		p.mutex.Lock()
+		p.isBusy = 0                // Reset busy state
+		// Do not reset requestsHandled to maintain fair load balancing
+		p.mutex.Unlock()
+		
+		// Start the process
 		p.Start()
 	}
 }
@@ -319,7 +332,14 @@ func NewProcessPool(
 		comTimeout:    comTimeout,
 		initTimeout:   initTimeout,
 	}
-	pool.queue = ProcessPQ{processes: make([]*ProcessWithPrio, 0), mutex: sync.Mutex{}, pool: pool}
+	// Initialize the queue with estimated capacity for all processes
+	pool.queue = ProcessPQ{
+		processes: make([]*ProcessWithPrio, 0, size),
+		mutex:     sync.RWMutex{},
+		pool:      pool,
+	}
+	
+	// Create all the processes
 	for i := 0; i < size; i++ {
 		pool.newProcess(name, i, cmd, cmdArgs, logger, cwd)
 	}
@@ -365,7 +385,8 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 	var exports []ProcessExport
 	for _, process := range pool.processes {
 		if process != nil {
-			process.mutex.Lock()
+			// Use read lock since we're only reading the process state
+			process.mutex.RLock()
 			exports = append(exports, ProcessExport{
 				IsReady:         atomic.LoadInt32(&process.isReady) == 1,
 				Latency:         process.latency,
@@ -373,7 +394,7 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 				Restarts:        process.restarts,
 				RequestsHandled: process.requestsHandled,
 			})
-			process.mutex.Unlock()
+			process.mutex.RUnlock()
 		}
 	}
 	pool.mutex.RUnlock()
@@ -391,11 +412,32 @@ func (pool *ProcessPool) GetWorker() (*Process, error) {
 		case <-timeoutTimer:
 			return nil, fmt.Errorf("timeout exceeded, no available workers")
 		case <-ticker.C:
+			// Update the queue with available workers
+			pool.queue.mutex.Lock()
 			pool.queue.Update()
+			
+			// Check if we have any available workers
 			if pool.queue.Len() > 0 {
+				// Use the standard heap package interface
 				processWithPrio := heap.Pop(&pool.queue).(*ProcessWithPrio)
-				pool.processes[processWithPrio.processId].SetBusy(1)
-				return pool.processes[processWithPrio.processId], nil
+				pool.queue.mutex.Unlock()
+				
+				// Now get the actual process and mark it as busy
+				pool.mutex.RLock()
+				if processWithPrio.processId >= len(pool.processes) || pool.processes[processWithPrio.processId] == nil {
+					// This should not happen, but we're being defensive
+					pool.mutex.RUnlock()
+					continue
+				}
+				
+				process := pool.processes[processWithPrio.processId]
+				pool.mutex.RUnlock()
+				
+				// Mark the process as busy
+				process.SetBusy(1)
+				return process, nil
+			} else {
+				pool.queue.mutex.Unlock()
 			}
 		}
 	}
@@ -448,7 +490,7 @@ type ProcessWithPrio struct {
 
 type ProcessPQ struct {
 	processes []*ProcessWithPrio
-	mutex     sync.Mutex
+	mutex     sync.RWMutex // Changed to RWMutex for more efficient concurrent reads
 	pool      *ProcessPool
 }
 
@@ -478,22 +520,26 @@ func (pq *ProcessPQ) Pop() interface{} {
 }
 
 func (pq *ProcessPQ) Update() {
-	pq.mutex.Lock()
-	defer pq.mutex.Unlock()
-
-	pq.processes = nil
-
+	// Note: This function should be called with pq.mutex already locked
+	
+	// Create a new slice rather than setting to nil for better performance
+	newProcesses := make([]*ProcessWithPrio, 0, cap(pq.processes))
+	
+	// Read pool state 
 	pq.pool.mutex.RLock()
-	defer pq.pool.mutex.RUnlock()
-
 	for _, process := range pq.pool.processes {
 		if process != nil && process.IsReady() && !process.IsBusy() {
-			pq.Push(&ProcessWithPrio{
+			process.mutex.RLock() // Use RLock since we're only reading
+			newProcesses = append(newProcesses, &ProcessWithPrio{
 				processId: process.id,
 				handled:   process.requestsHandled,
 			})
+			process.mutex.RUnlock()
 		}
 	}
-
+	pq.pool.mutex.RUnlock()
+	
+	// Update the internal slice and initialize the heap
+	pq.processes = newProcesses
 	heap.Init(pq)
 }
