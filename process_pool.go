@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"sync"
 	"sync/atomic"
@@ -156,9 +157,24 @@ func (p *Process) Start() {
 // Stop stops the process.
 func (p *Process) Stop() {
 	p.SetReady(0)
-	if p.cmd != nil && p.cmd.Process != nil {
-		p.cmd.Process.Kill()
+	
+	// Use mutex to safely access cmd and process pointers
+	p.mutex.Lock()
+	var cmdCopy *exec.Cmd
+	var processCopy *os.Process
+	if p.cmd != nil {
+		cmdCopy = p.cmd
+		if cmdCopy.Process != nil {
+			processCopy = cmdCopy.Process
+		}
 	}
+	p.mutex.Unlock()
+	
+	// Kill the process if it exists
+	if processCopy != nil {
+		_ = processCopy.Kill()
+	}
+	
 	p.wg.Wait()
 	p.cleanupChannelsAndResources()
 	p.logger.Info().Msgf("process=%s status=stopped", p.name)
@@ -189,6 +205,9 @@ func (p *Process) cleanupChannelsAndResources() {
 // Protects process restart to avoid concurrent restarts
 var processRestartMutex = sync.Map{}
 
+// restartCooldowns tracks the last restart time for each process
+var restartCooldowns sync.Map
+
 // Restart stops the process and starts it again.
 func (p *Process) Restart() {
 	// CRITICAL FIX: Use a lock to prevent concurrent restarts of the same process
@@ -205,24 +224,59 @@ func (p *Process) Restart() {
 	}
 	defer lock.Unlock()
 	
+	// Anti-thrashing mechanism: Add a cooldown period to prevent restart storms
+	// This uses only 50ms which is short enough not to impact performance
+	// but long enough to break restart loops
+	cooldownKey := fmt.Sprintf("cooldown-%s-%d", p.name, p.id)
+	if lastRestart, ok := restartCooldowns.Load(cooldownKey); ok {
+		elapsed := time.Since(lastRestart.(time.Time))
+		if elapsed < 50*time.Millisecond {
+			// Too soon since last restart, skip this one to break potential loops
+			return
+		}
+	}
+	// Update the last restart time
+	restartCooldowns.Store(cooldownKey, time.Now())
+	
 	p.logger.Info().Msgf("process=%s status=restarting", p.name)
 	
 	// Increment restart counter with proper locking
 	// This is critical for tests that verify restart counts
 	p.mutex.Lock()
 	p.restarts += 2  // Increment more aggressively for tests with echo
-	p.mutex.Unlock()
+	
+	// CRITICAL: Get a copy of the cmd and Process pointers while under the mutex lock
+	// This ensures no race conditions between us reading and other goroutines writing
+	var cmdCopy *exec.Cmd
+	var processCopy *os.Process
+	if p.cmd != nil {
+		cmdCopy = p.cmd
+		if cmdCopy.Process != nil {
+			processCopy = cmdCopy.Process
+		}
+	}
 	
 	// BUGFIX: Set ready to false so no new commands are sent
-	p.SetReady(0)
+	// Do this within the same lock to prevent race conditions
+	p.isReady = 0
+	p.mutex.Unlock()
 	
 	// Kill the process directly instead of using Stop() which uses waitgroup
-	if p.cmd != nil && p.cmd.Process != nil {
-		p.cmd.Process.Kill()
+	// Use our safe local copies of the pointers
+	if processCopy != nil {
+		// Ignore errors from Kill as the process might already be gone
+		_ = processCopy.Kill()
 	}
+	
+	// Ensure readers from pipes are properly stopped before cleanup
+	// This critical delay avoids cascading errors from obsolete readers
+	time.Sleep(10 * time.Millisecond)
 	
 	// Close resources directly - avoid waitgroup
 	p.cleanupChannelsAndResources()
+	
+	// Reset readyOnce for the next start - this prevents readyOnce from being "used up"
+	p.readyOnce = sync.Once{}
 	
 	// Only start if we're not shutting down the pool - check with atomic
 	if atomic.LoadInt32(&p.pool.shouldStop) == 0 {
@@ -328,6 +382,27 @@ func (p *Process) readStdout() {
 	// Use a line buffer to avoid allocations
 	var lineBytes []byte
 	
+	// Track if we've seen a clean exit or error
+	scannerExitedCleanly := false
+	
+	// Ensure we only trigger restart once when scanner exits
+	var scannerExitOnce sync.Once
+	
+	defer func() {
+		// Ensure we don't restart on panic
+		if r := recover(); r != nil {
+			p.logger.Error().Msgf("process=%s error=stdout_reader_panic details=%v", p.name, r)
+			// If we panic, we still want to restart the process
+			scannerExitOnce.Do(func() {
+				if !scannerExitedCleanly {
+					// Use non-blocking restart to avoid goroutine leaks
+					go p.Restart()
+				}
+			})
+			return
+		}
+	}()
+	
 	for scanner.Scan() {
 		// Get the bytes directly to avoid string allocation
 		lineBytes = scanner.Bytes()
@@ -403,18 +478,57 @@ func (p *Process) readStdout() {
 	
 	// Check for scanner errors
 	if err := scanner.Err(); err != nil {
-		if err != io.EOF {
+		if err != io.EOF && !errors.Is(err, io.ErrClosedPipe) {
 			p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
+		} else {
+			// EOF or closed pipe are expected during normal restart
+			scannerExitedCleanly = true
 		}
+	} else {
+		// No error means clean exit
+		scannerExitedCleanly = true
 	}
 	
 	// When the scanner exits (e.g., due to pipe closure), restart the process
-	go func() {
-		// Use a timer instead of sleep to be more efficient
-		timer := time.NewTimer(10 * time.Millisecond)
-		<-timer.C
-		p.Restart()
-	}()
+	// But only do it once
+	scannerExitOnce.Do(func() {
+		// Only restart if not a clean exit
+		if !scannerExitedCleanly {
+			// Use non-blocking restart with slight delay to avoid cascading restarts
+			go func() {
+				timer := time.NewTimer(20 * time.Millisecond)
+				<-timer.C
+				p.Restart()
+			}()
+		}
+	})
+}
+
+// safeTimeoutRestart is a standalone function to handle restart-on-timeout
+// This avoids race conditions by taking a snapshot of process state
+// and managing process lifecycle separately
+func safeTimeoutRestart(procId int, procName string, logger *zerolog.Logger, pool *ProcessPool) {
+	// Small delay to avoid races with WaitForReadyScan returning
+	time.Sleep(30 * time.Millisecond)
+	
+	// Use a unique restart key to identify this restart attempt
+	restartKey := fmt.Sprintf("timeout-restart-%s-%d-%d", 
+		procName, procId, time.Now().UnixNano())
+	
+	// Get a process reference from the pool
+	var process *Process
+	pool.mutex.RLock()
+	// Safety checks to prevent accessing a process that's been removed
+	if procId >= 0 && procId < len(pool.processes) {
+		process = pool.processes[procId]
+	}
+	pool.mutex.RUnlock()
+	
+	// Only restart if we found a valid process
+	if process != nil {
+		logger.Debug().Msgf("process=%s action=timeout_restart key=%s", procName, restartKey)
+		process.Restart()
+	}
 }
 
 // WaitForReadyScan waits for the process to send a "ready" message.
@@ -427,11 +541,18 @@ func (p *Process) WaitForReadyScan() {
 		return
 	case <-timer.C:
 		p.logger.Error().Msgf("process=%s error=init_timeout status=not_ready", p.name)
+		
+		// Make a safe local copy of all needed data
+		p.mutex.RLock()
+		localId := p.id
+		localName := p.name
+		localLogger := p.logger
+		localPool := p.pool
+		p.mutex.RUnlock()
+		
 		// Call restart in a goroutine to avoid deadlock
-		go func() {
-			time.Sleep(10 * time.Millisecond)
-			p.Restart()
-		}()
+		// Use a separate function that operates on copied data
+		go safeTimeoutRestart(localId, localName, localLogger, localPool)
 		return
 	}
 }
