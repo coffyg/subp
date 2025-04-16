@@ -183,7 +183,16 @@ func (p *Process) SetBusy(busy int32) {
 // readStderr reads from stderr and logs any output.
 func (p *Process) readStderr() {
 	for {
-		line, err := p.stderr.ReadString('\n')
+		p.mutex.RLock()
+		stderr := p.stderr
+		p.mutex.RUnlock()
+		
+		// Check if stderr is nil (could happen during restart)
+		if stderr == nil {
+			return
+		}
+		
+		line, err := stderr.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
 				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stderr", p.name)
@@ -199,7 +208,16 @@ func (p *Process) readStderr() {
 // WaitForReadyScan waits for the process to send a "ready" message.
 func (p *Process) WaitForReadyScan() {
 	for {
-		line, err := p.stdout.ReadString('\n')
+		p.mutex.RLock()
+		stdout := p.stdout
+		p.mutex.RUnlock()
+		
+		// Check if stdout is nil (could happen during restart)
+		if stdout == nil {
+			return
+		}
+		
+		line, err := stdout.ReadString('\n')
 		if err != nil {
 			p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
 			p.Restart()
@@ -237,8 +255,24 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 	start := time.Now().UnixMilli()
 
-	// Send command
-	if err := p.stdin.Encode(cmd); err != nil {
+	// Access stdin with mutex protection
+	p.mutex.RLock()
+	stdin := p.stdin
+	p.mutex.RUnlock()
+	
+	// Check if stdin is nil (could happen during restart)
+	if stdin == nil {
+		p.logger.Error().Msgf("[nyxsub|%s] stdin is nil", p.name)
+		p.Restart()
+		return nil, errors.New("stdin is nil")
+	}
+	
+	// Send command with mutex protection to prevent races
+	p.mutex.RLock()
+	err := p.stdin.Encode(cmd)
+	p.mutex.RUnlock()
+	
+	if err != nil {
 		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to send command", p.name)
 		p.Restart()
 		return nil, err
@@ -273,7 +307,17 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 			p.logger.Error().Msgf("[nyxsub|%s] Communication timed out", p.name)
 			return nil, errors.New("communication timed out")
 		default:
-			line, err := p.stdout.ReadString('\n')
+			// Access stdout with mutex protection
+			p.mutex.RLock()
+			stdout := p.stdout
+			p.mutex.RUnlock()
+			
+			// Check if stdout is nil (could happen during restart)
+			if stdout == nil {
+				return nil, errors.New("stdout is nil")
+			}
+			
+			line, err := stdout.ReadString('\n')
 			if err != nil {
 				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
 				return nil, err
