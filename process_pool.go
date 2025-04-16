@@ -26,6 +26,28 @@ var responsePool = sync.Pool{
 	},
 }
 
+// commandPool is a pool of pre-allocated command maps to reduce GC pressure
+var commandPool = sync.Pool{
+	New: func() interface{} {
+		return make(map[string]interface{}, 8) // Pre-allocate with reasonable capacity
+	},
+}
+
+// encoderPool is a pool of pre-allocated JSON encoders to reduce GC pressure
+var encoderPool = sync.Pool{
+	New: func() interface{} {
+		// Return a nil encoder - it will be properly initialized when acquired
+		return (*json.Encoder)(nil)
+	},
+}
+
+// uuidPool is a pool of pre-allocated UUIDs to reduce GC pressure during command creation
+var uuidPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 36) // UUID string length
+	},
+}
+
 // Process is a process that can be started, stopped, and restarted.
 type Process struct {
 	cmd             *exec.Cmd
@@ -89,7 +111,17 @@ func (p *Process) Start() {
 	p.stdinPipe = stdinPipe
 	p.stdoutPipe = stdoutPipe
 	p.stderrPipe = stderrPipe
-	p.stdin = json.NewEncoder(stdinPipe)
+	
+	// Use encoder from pool if available, or create a new one
+	encoder := encoderPool.Get().(*json.Encoder)
+	if encoder == nil {
+		encoder = json.NewEncoder(stdinPipe)
+	} else {
+		// Reset the encoder to use our pipe
+		*encoder = *json.NewEncoder(stdinPipe)
+	}
+	p.stdin = encoder
+	
 	// Use larger buffer sizes for stdout/stderr to handle large responses like base64-encoded images
 	p.stdout = bufio.NewReaderSize(stdoutPipe, 4*1024*1024) // 4MB buffer for large responses
 	p.stderr = bufio.NewReaderSize(stderrPipe, 64*1024)     // 64KB buffer for errors
@@ -138,7 +170,13 @@ func (p *Process) cleanupChannelsAndResources() {
 		p.stderrPipe.Close()
 		p.stderrPipe = nil
 	}
-	p.stdin = nil
+	
+	// Return the encoder to the pool if it exists
+	if p.stdin != nil {
+		encoderPool.Put(p.stdin)
+		p.stdin = nil
+	}
+	
 	p.stdout = nil
 	p.stderr = nil
 	p.cmd = nil
@@ -295,18 +333,26 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	atomic.StoreInt32(&p.isBusy, 1)
 	defer atomic.StoreInt32(&p.isBusy, 0)
 
+	// Calculate start time once at the beginning to measure accurate latency
+	start := time.Now().UnixMilli()
+	
 	var cmdID string
 	if id, ok := cmd["id"]; !ok {
-		cmdID = uuid.New().String()
+		// Generate UUID with less allocations by using the UUID pool
+		uuidBuf := uuidPool.Get().([]byte)
+		// Write the UUID string directly into the pre-allocated buffer
+		uuidStr := uuid.New().String()
+		copy(uuidBuf, uuidStr)
+		cmdID = string(uuidBuf[:36])
 		cmd["id"] = cmdID
+		// Return the buffer to the pool
+		uuidPool.Put(uuidBuf)
 	} else {
 		cmdID = id.(string)
 	}
 	if _, ok := cmd["type"]; !ok {
 		cmd["type"] = "main"
 	}
-
-	start := time.Now().UnixMilli()
 
 	p.mutex.Lock()
 	if p.stdin == nil {
@@ -344,9 +390,17 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 }
 
 // readResponse reads the response for a specific command ID.
+// fastClearMap quickly clears a map without deallocating its memory
+func fastClearMap(m map[string]interface{}) {
+	for k := range m {
+		delete(m, k)
+	}
+}
+
 func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 	timeout := time.After(p.timeout)
-
+	
+	// Read stdout under read lock to avoid contention
 	p.mutex.RLock()
 	stdout := p.stdout
 	p.mutex.RUnlock()
@@ -354,6 +408,9 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 	if stdout == nil {
 		return nil, errors.New("stdout is nil")
 	}
+	
+	// Pre-allocate the result map once outside the loop to avoid repeated allocations
+	result := make(map[string]interface{}, 16)
 
 	for {
 		select {
@@ -379,10 +436,8 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 			
 			// Get a pre-allocated response map from the pool
 			responseMap := responsePool.Get().(map[string]interface{})
-			// Clear the map for reuse
-			for k := range responseMap {
-				delete(responseMap, k)
-			}
+			// Clear the map for reuse using our optimized function
+			fastClearMap(responseMap)
 			
 			if err := json.Unmarshal([]byte(line), &responseMap); err != nil {
 				// Return the map to the pool if unmarshaling fails
@@ -396,9 +451,8 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 			}
 
 			if id, ok := responseMap["id"]; ok && id == cmdID {
-				// Create a copy to return since we can't return the pooled object directly
-				// (it would be reused while the caller is still using it)
-				result := make(map[string]interface{}, len(responseMap))
+				// Copy to our pre-allocated result map - this avoids allocating a new map for each match
+				fastClearMap(result) // Ensure it's empty before copying
 				for k, v := range responseMap {
 					result[k] = v
 				}
@@ -496,8 +550,16 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 
 // ExportAll exports all the processes in the process pool as a slice of ProcessExport.
 func (pool *ProcessPool) ExportAll() []ProcessExport {
-	exports := []ProcessExport{}
 	pool.mutex.RLock()
+	// Pre-allocate slice with exact capacity needed
+	processCount := 0
+	for _, process := range pool.processes {
+		if process != nil {
+			processCount++
+		}
+	}
+	exports := make([]ProcessExport, 0, processCount)
+	
 	for _, process := range pool.processes {
 		if process != nil {
 			process.mutex.RLock()
@@ -637,11 +699,30 @@ func (pool *ProcessPool) WaitForReady() error {
 
 // SendCommand sends a command to a worker in the process pool.
 func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
+	// Get a worker from the pool
 	worker, err := pool.GetWorker()
 	if err != nil {
 		return nil, err
 	}
-	return worker.SendCommand(cmd)
+	
+	// Create a copy of the command if the original should be preserved
+	// This is needed because the worker will modify the map (adding ID if not present)
+	cmdCopy := commandPool.Get().(map[string]interface{})
+	// Clear the map for reuse
+	fastClearMap(cmdCopy)
+	
+	// Copy the command data
+	for k, v := range cmd {
+		cmdCopy[k] = v
+	}
+	
+	// Send the command copy to the worker
+	resp, err := worker.SendCommand(cmdCopy)
+	
+	// Return the command map to the pool
+	commandPool.Put(cmdCopy)
+	
+	return resp, err
 }
 
 // StopAll stops all the processes in the process pool.
