@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -81,8 +82,9 @@ func (p *Process) Start() {
 	p.stdoutPipe = stdoutPipe
 	p.stderrPipe = stderrPipe
 	p.stdin = json.NewEncoder(stdinPipe)
-	p.stdout = bufio.NewReader(stdoutPipe)
-	p.stderr = bufio.NewReader(stderrPipe)
+	// Use larger buffer sizes for stdout/stderr to handle large responses like base64-encoded images
+	p.stdout = bufio.NewReaderSize(stdoutPipe, 4*1024*1024) // 4MB buffer for large responses
+	p.stderr = bufio.NewReaderSize(stderrPipe, 64*1024)     // 64KB buffer for errors
 	p.mutex.Unlock()
 
 	p.wg.Add(2)
@@ -138,24 +140,17 @@ func (p *Process) cleanupChannelsAndResources() {
 // Restart stops the process and starts it again.
 func (p *Process) Restart() {
 	p.logger.Info().Msgf("[nyxsub|%s] Restarting process", p.name)
-	
-	// Increment restart counter
+	atomic.StoreInt32(&p.isReady, 0)
 	p.mutex.Lock()
 	p.restarts++
 	p.mutex.Unlock()
-	
-	// Stop the current process
+	if atomic.LoadInt32(&p.pool.shouldStop) == 1 {
+		p.Stop()
+		return
+	}
+	atomic.StoreInt32(&p.isBusy, 0)
 	p.Stop()
-	
-	// Only start if the pool is not being shut down
 	if atomic.LoadInt32(&p.pool.shouldStop) == 0 {
-		// Reset state before starting
-		p.mutex.Lock()
-		p.isBusy = 0                // Reset busy state
-		// Do not reset requestsHandled to maintain fair load balancing
-		p.mutex.Unlock()
-		
-		// Start the process
 		p.Start()
 	}
 }
@@ -186,12 +181,9 @@ func (p *Process) readStderr() {
 		p.mutex.RLock()
 		stderr := p.stderr
 		p.mutex.RUnlock()
-		
-		// Check if stderr is nil (could happen during restart)
 		if stderr == nil {
 			return
 		}
-		
 		line, err := stderr.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
@@ -200,92 +192,65 @@ func (p *Process) readStderr() {
 			return
 		}
 		if line != "" && line != "\n" {
-			p.logger.Error().Msgf("[nyxsub|%s|stderr] %s", p.name, line)
+			// Trim trailing newlines and whitespace for cleaner output
+			trimmedLine := strings.TrimSpace(line)
+			
+			// Log with more informative prefix indicating subprocess stderr - using Info level
+			// since subprocess stderr output is often informational and not an actual error
+			p.logger.Info().Msgf("[nyxsub|%s|stderr] Subprocess: %s", p.name, trimmedLine)
 		}
 	}
 }
 
 // WaitForReadyScan waits for the process to send a "ready" message.
 func (p *Process) WaitForReadyScan() {
-	// Pre-allocate response object to reduce GC pressure
-	responseBuf := make(map[string]interface{}, 2)
-	
-	// Create a timeout to avoid potential deadlocks
-	timeoutTimer := time.NewTimer(p.initTimeout)
-	defer timeoutTimer.Stop()
-	
-	// Create a ticker for throttling error messages
-	errorTicker := time.NewTicker(500 * time.Millisecond)
-	defer errorTicker.Stop()
-	lastErrorTime := time.Now()
-	
 	for {
-		select {
-		case <-timeoutTimer.C:
-			p.logger.Error().Msgf("[nyxsub|%s] Timed out waiting for ready message", p.name)
-			return
-		default:
-			// Use a critical section for the actual read
-			p.mutex.Lock()
-			stdout := p.stdout
-			if stdout == nil {
-				p.mutex.Unlock()
-				return
-			}
-			
-			line, err := stdout.ReadString('\n')
+		p.mutex.Lock()
+		stdout := p.stdout
+		if stdout == nil {
 			p.mutex.Unlock()
-			
-			if err != nil {
-				// Throttle error messages to avoid spamming logs
-				if time.Since(lastErrorTime) > 500*time.Millisecond {
-					p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
-					lastErrorTime = time.Now()
-				}
-				
-				// If this is a real error rather than just timeout, restart
-				if err != io.EOF {
-					p.Restart()
-					return
-				}
-				
-				// Brief sleep to avoid CPU spinning on EOF
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			
-			if line == "" || line == "\n" {
-				continue
-			}
-
-			// Clear the response map for reuse
-			for k := range responseBuf {
-				delete(responseBuf, k)
-			}
-			
-			if err := json.Unmarshal([]byte(line), &responseBuf); err != nil {
-				p.logger.Warn().Msgf("[nyxsub|%s] Non JSON message received: '%s'", p.name, line)
-				continue
-			}
-
-			// Check for ready message
-			if typeVal, ok := responseBuf["type"]; ok && typeVal == "ready" {
-				p.logger.Info().Msgf("[nyxsub|%s] Process is ready", p.name)
-				p.SetReady(1)
+			return
+		}
+		line, err := stdout.ReadString('\n')
+		p.mutex.Unlock()
+		if err != nil {
+			if err != io.EOF {
+				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
+				p.Restart()
 				return
 			}
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		if line == "" || line == "\n" {
+			continue
+		}
+		var response map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &response); err != nil {
+			// Format non-JSON messages more clearly
+			trimmedLine := strings.TrimSpace(line)
+			p.logger.Info().Msgf("[nyxsub|%s|stdout] Non-JSON output: %s", p.name, trimmedLine)
+			continue
+		}
+		if typeVal, ok := response["type"]; ok && typeVal == "ready" {
+			p.logger.Info().Msgf("[nyxsub|%s] Process is ready", p.name)
+			p.SetReady(1)
+			return
 		}
 	}
 }
 
 // SendCommand sends a command to the process and waits for the response.
 func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
-	p.SetBusy(1)
-	defer p.SetBusy(0)
+	atomic.StoreInt32(&p.isBusy, 1)
+	defer atomic.StoreInt32(&p.isBusy, 0)
 
-	// Pre-allocate common fields only if needed for better performance
-	if _, ok := cmd["id"]; !ok {
-		cmd["id"] = uuid.New().String()
+	var cmdID string
+	if id, ok := cmd["id"]; !ok {
+		cmdID = uuid.New().String()
+		cmd["id"] = cmdID
+	} else {
+		cmdID = id.(string)
 	}
 	if _, ok := cmd["type"]; !ok {
 		cmd["type"] = "main"
@@ -293,45 +258,33 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 	start := time.Now().UnixMilli()
 
-	// Use a shorter critical section with RLock for checking nil 
-	// The actual Encode operation needs exclusive access
-	p.mutex.RLock()
+	p.mutex.Lock()
 	if p.stdin == nil {
-		p.mutex.RUnlock()
+		p.mutex.Unlock()
 		p.logger.Error().Msgf("[nyxsub|%s] stdin is nil", p.name)
 		p.Restart()
 		return nil, errors.New("stdin is nil")
 	}
-	p.mutex.RUnlock()
-	
-	// Lock only for the actual encode operation
-	p.mutex.Lock()
 	err := p.stdin.Encode(cmd)
 	p.mutex.Unlock()
-	
 	if err != nil {
 		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to send command", p.name)
 		p.Restart()
 		return nil, err
 	}
 
-	// Log the command sent only at debug level
 	if p.logger.Debug().Enabled() {
-		jsonCmd, _ := json.Marshal(cmd)
-		p.logger.Debug().Msgf("[nyxsub|%s] Command sent: %v", p.name, string(jsonCmd))
+		cmdb, _ := json.Marshal(cmd)
+		p.logger.Debug().Msgf("[nyxsub|%s] Command sent: %s", p.name, string(cmdb))
 	}
 
-	// Wait for response
-	response, err := p.readResponse(cmd["id"].(string))
+	response, err := p.readResponse(cmdID)
 	if err != nil {
 		p.Restart()
 		return nil, err
 	}
 
-	// Use atomic operations for metrics updates to reduce lock contention
-	now := time.Now().UnixMilli()
-	latency := now - start
-	
+	latency := time.Now().UnixMilli() - start
 	p.mutex.Lock()
 	p.latency = latency
 	p.requestsHandled++
@@ -342,63 +295,47 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 // readResponse reads the response for a specific command ID.
 func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
-	// Pre-allocate timeout timer once rather than recreating it on each iteration
-	timeoutTimer := time.NewTimer(p.timeout)
-	defer timeoutTimer.Stop()
+	timeout := time.After(p.timeout)
 
-	// Pre-check stdout with read lock before entering the loop
 	p.mutex.RLock()
-	if p.stdout == nil {
-		p.mutex.RUnlock()
-		return nil, errors.New("stdout is nil")
-	}
+	stdout := p.stdout
 	p.mutex.RUnlock()
 
-	// Create a small buffer for reads to reduce allocations
-	responseBuf := make(map[string]interface{}, 4)
-	
+	if stdout == nil {
+		return nil, errors.New("stdout is nil")
+	}
+
 	for {
 		select {
-		case <-timeoutTimer.C:
+		case <-timeout:
 			p.logger.Error().Msgf("[nyxsub|%s] Communication timed out", p.name)
 			return nil, errors.New("communication timed out")
 		default:
-			// Use exclusive lock for the actual read since bufio.Reader is not threadsafe
 			p.mutex.Lock()
-			// Double-check stdout is not nil before reading
 			if p.stdout == nil {
 				p.mutex.Unlock()
 				return nil, errors.New("stdout is nil")
 			}
-			
 			line, err := p.stdout.ReadString('\n')
 			p.mutex.Unlock()
-			
 			if err != nil {
 				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
 				return nil, err
 			}
 			if line == "" || line == "\n" {
+				time.Sleep(1 * time.Millisecond)
+				continue
+			}
+			var response map[string]interface{}
+			if err := json.Unmarshal([]byte(line), &response); err != nil {
+				// Format non-JSON messages more clearly - using Info level since
+				// non-JSON output from subprocess is often informational, not a warning
+				trimmedLine := strings.TrimSpace(line)
+				p.logger.Info().Msgf("[nyxsub|%s|stdout] Non-JSON output: %s", p.name, trimmedLine)
 				continue
 			}
 
-			// Reset map for reuse to reduce allocations
-			for k := range responseBuf {
-				delete(responseBuf, k)
-			}
-			
-			if err := json.Unmarshal([]byte(line), &responseBuf); err != nil {
-				p.logger.Warn().Msgf("[nyxsub|%s] Non JSON message received: '%s'", p.name, line)
-				continue
-			}
-
-			// Check for matching response ID
-			if id, ok := responseBuf["id"]; ok && id == cmdID {
-				// Create a copy of the response to return
-				response := make(map[string]interface{}, len(responseBuf))
-				for k, v := range responseBuf {
-					response[k] = v
-				}
+			if id, ok := response["id"]; ok && id == cmdID {
 				return response, nil
 			}
 		}
@@ -441,14 +378,11 @@ func NewProcessPool(
 		comTimeout:    comTimeout,
 		initTimeout:   initTimeout,
 	}
-	// Initialize the queue with estimated capacity for all processes
 	pool.queue = ProcessPQ{
 		processes: make([]*ProcessWithPrio, 0, size),
 		mutex:     sync.RWMutex{},
 		pool:      pool,
 	}
-	
-	// Create all the processes
 	for i := 0; i < size; i++ {
 		pool.newProcess(name, i, cmd, cmdArgs, logger, cwd)
 	}
@@ -490,11 +424,10 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 
 // ExportAll exports all the processes in the process pool as a slice of ProcessExport.
 func (pool *ProcessPool) ExportAll() []ProcessExport {
+	exports := []ProcessExport{}
 	pool.mutex.RLock()
-	var exports []ProcessExport
 	for _, process := range pool.processes {
 		if process != nil {
-			// Use read lock since we're only reading the process state
 			process.mutex.RLock()
 			exports = append(exports, ProcessExport{
 				IsReady:         atomic.LoadInt32(&process.isReady) == 1,
@@ -512,88 +445,43 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 
 // GetWorker returns a worker process from the process pool.
 func (pool *ProcessPool) GetWorker() (*Process, error) {
-	// Early exit if pool is shutting down
 	if atomic.LoadInt32(&pool.shouldStop) == 1 {
 		return nil, fmt.Errorf("process pool is stopping")
 	}
 
-	// Use timer for better performance than time.After
-	timeoutTimer := time.NewTimer(pool.workerTimeout)
-	defer timeoutTimer.Stop()
-	
-	// Use adaptive ticker frequency - start fast, then slow down
-	// This improves responsiveness while reducing CPU usage for long waits
-	tickerInterval := time.Millisecond * 10 // Start with faster polling
-	maxInterval := time.Millisecond * 100   // Maximum interval
-	tickCount := 0
-	ticker := time.NewTicker(tickerInterval)
+	timeout := time.After(pool.workerTimeout)
+	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-timeoutTimer.C:
+		case <-timeout:
 			return nil, fmt.Errorf("timeout exceeded, no available workers")
 		case <-ticker.C:
-			// Adaptive polling - increase interval gradually
-			tickCount++
-			if tickCount > 10 && tickerInterval < maxInterval {
-				tickerInterval = tickerInterval * 2
-				if tickerInterval > maxInterval {
-					tickerInterval = maxInterval
-				}
-				ticker.Reset(tickerInterval)
-			}
-			
-			// Check for any ready workers before locking queue
 			anyReady := false
 			pool.mutex.RLock()
 			for _, process := range pool.processes {
-				if process != nil && atomic.LoadInt32(&process.isReady) == 1 && 
-				   atomic.LoadInt32(&process.isBusy) == 0 {
+				if process != nil && atomic.LoadInt32(&process.isReady) == 1 && atomic.LoadInt32(&process.isBusy) == 0 {
 					anyReady = true
 					break
 				}
 			}
 			pool.mutex.RUnlock()
-			
 			if !anyReady {
-				continue // No workers available, avoid locking the queue
+				continue
 			}
-			
-			// Update the queue with available workers
 			pool.queue.mutex.Lock()
 			pool.queue.Update()
-			
-			// Check if we have any available workers
 			if pool.queue.Len() > 0 {
-				// Use the standard heap package interface
 				processWithPrio := heap.Pop(&pool.queue).(*ProcessWithPrio)
 				pid := processWithPrio.processId
 				pool.queue.mutex.Unlock()
-				
-				// Try to get and mark the process as busy atomically
-				var process *Process
 				pool.mutex.RLock()
-				if pid < len(pool.processes) {
-					process = pool.processes[pid]
-				}
+				process := pool.processes[pid]
 				pool.mutex.RUnlock()
-				
-				// Verify process exists and is ready
-				if process != nil {
-					// Try to mark process as busy atomically
-					if atomic.LoadInt32(&process.isReady) == 1 && 
-					   atomic.CompareAndSwapInt32(&process.isBusy, 0, 1) {
-						// Reset ticker interval on success
-						tickerInterval = time.Millisecond * 10
-						ticker.Reset(tickerInterval)
-						return process, nil
-					}
+				if process != nil && atomic.LoadInt32(&process.isReady) == 1 && atomic.CompareAndSwapInt32(&process.isBusy, 0, 1) {
+					return process, nil
 				}
-				
-				// Process wasn't available, retry immediately
-				tickerInterval = time.Millisecond * 10
-				ticker.Reset(tickerInterval)
 			} else {
 				pool.queue.mutex.Unlock()
 			}
@@ -603,38 +491,17 @@ func (pool *ProcessPool) GetWorker() (*Process, error) {
 
 // WaitForReady waits until at least one worker is ready or times out.
 func (pool *ProcessPool) WaitForReady() error {
-	// Use timer instead of time.After for better performance
-	timeoutTimer := time.NewTimer(pool.initTimeout)
-	defer timeoutTimer.Stop()
-	
-	// Use adaptive polling strategy - start with short intervals, then increase
-	// This gives good responsiveness while keeping CPU usage reasonable
-	pollInterval := 20 * time.Millisecond  // Start with short intervals
-	maxInterval := 200 * time.Millisecond  // Maximum polling interval
-	ticker := time.NewTicker(pollInterval)
+	timeout := time.After(pool.initTimeout)
+	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
-	
-	pollCount := 0
-	
-	// Look for ready workers
+
 	for {
 		select {
-		case <-timeoutTimer.C:
+		case <-timeout:
 			return fmt.Errorf("timeout waiting for workers to be ready")
 		case <-ticker.C:
-			// Adaptive polling - increase interval gradually
-			pollCount++
-			if pollCount > 5 && pollInterval < maxInterval {
-				pollInterval = pollInterval * 2
-				if pollInterval > maxInterval {
-					pollInterval = maxInterval
-				}
-				ticker.Reset(pollInterval)
-			}
-			
-			// Check if any worker is ready
-			pool.mutex.RLock()
 			ready := false
+			pool.mutex.RLock()
 			for _, process := range pool.processes {
 				if process != nil && atomic.LoadInt32(&process.isReady) == 1 {
 					ready = true
@@ -642,7 +509,6 @@ func (pool *ProcessPool) WaitForReady() error {
 				}
 			}
 			pool.mutex.RUnlock()
-			
 			if ready {
 				return nil
 			}
@@ -663,7 +529,9 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 func (pool *ProcessPool) StopAll() {
 	pool.SetStop()
 	for _, process := range pool.processes {
-		process.Stop()
+		if process != nil {
+			process.Stop()
+		}
 	}
 }
 
@@ -674,7 +542,7 @@ type ProcessWithPrio struct {
 
 type ProcessPQ struct {
 	processes []*ProcessWithPrio
-	mutex     sync.RWMutex // Changed to RWMutex for more efficient concurrent reads
+	mutex     sync.RWMutex
 	pool      *ProcessPool
 }
 
@@ -704,51 +572,18 @@ func (pq *ProcessPQ) Pop() interface{} {
 }
 
 func (pq *ProcessPQ) Update() {
-	// Note: This function should be called with pq.mutex already locked
-	
-	// Reuse existing slice if possible to reduce allocations
-	if len(pq.processes) > 0 {
-		pq.processes = pq.processes[:0] // Clear slice but maintain capacity
-	} else if cap(pq.processes) < len(pq.pool.processes) {
-		// If slice capacity is too small, allocate a new one
-		pq.processes = make([]*ProcessWithPrio, 0, len(pq.pool.processes))
-	}
-	
-	// Create a small cache of ProcessWithPrio objects to reuse
-	var prioCache []*ProcessWithPrio
-	
-	// Use atomic operations for faster ready/busy checks
+	pq.processes = pq.processes[:0]
 	pq.pool.mutex.RLock()
 	for _, process := range pq.pool.processes {
-		if process != nil && 
-		   atomic.LoadInt32(&process.isReady) == 1 && 
-		   atomic.LoadInt32(&process.isBusy) == 0 {
-			
-			process.mutex.RLock() // Use RLock since we're only reading
-			handled := process.requestsHandled
+		if process != nil && atomic.LoadInt32(&process.isReady) == 1 && atomic.LoadInt32(&process.isBusy) == 0 {
+			process.mutex.RLock()
+			pq.processes = append(pq.processes, &ProcessWithPrio{
+				processId: process.id,
+				handled:   process.requestsHandled,
+			})
 			process.mutex.RUnlock()
-			
-			// Reuse objects from cache when possible to reduce allocations
-			var pwp *ProcessWithPrio
-			if len(prioCache) > 0 {
-				pwp = prioCache[len(prioCache)-1]
-				prioCache = prioCache[:len(prioCache)-1]
-				pwp.processId = process.id
-				pwp.handled = handled
-			} else {
-				pwp = &ProcessWithPrio{
-					processId: process.id,
-					handled:   handled,
-				}
-			}
-			
-			pq.processes = append(pq.processes, pwp)
 		}
 	}
 	pq.pool.mutex.RUnlock()
-	
-	// Only initialize the heap if we have processes
-	if len(pq.processes) > 0 {
-		heap.Init(pq)
-	}
+	heap.Init(pq)
 }
