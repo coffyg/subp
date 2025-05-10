@@ -1,4 +1,3 @@
-// process_pool.go
 package subp
 
 import (
@@ -17,14 +16,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// safeTruncate is a small helper to truncate very large strings
-// for logging. This avoids flooding logs with huge base64 or JSON.
-func safeTruncate(str string, maxLen int) string {
-	if len(str) <= maxLen {
-		return str
-	}
-	return str[:maxLen] + "...(truncated)"
-}
+// maxLogStringSize is the maximum number of characters we log for large strings.
+const maxLogStringSize = 512
 
 // Process is a process that can be started, stopped, and restarted.
 type Process struct {
@@ -64,23 +57,24 @@ type ProcessExport struct {
 	RequestsHandled int    `json:"RequestsHandled"`
 }
 
-// Start starts the process by creating a new exec.Cmd, setting up the stdin and stdout pipes, and starting the process.
+// Start starts the process by creating a new exec.Cmd, setting up the stdin/stdout/stderr pipes, and starting the process.
 func (p *Process) Start() {
 	p.SetReady(0)
+
 	cmd := exec.Command(p.cmdStr, p.cmdArgs...)
 	stdinPipe, err := cmd.StdinPipe()
 	if err != nil {
-		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to get stdin pipe for process", p.name)
+		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to get stdin pipe", p.name)
 		return
 	}
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
-		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to get stdout pipe for process", p.name)
+		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to get stdout pipe", p.name)
 		return
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
-		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to get stderr pipe for process", p.name)
+		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to get stderr pipe", p.name)
 		return
 	}
 
@@ -94,9 +88,7 @@ func (p *Process) Start() {
 	p.stderr = bufio.NewReader(stderrPipe)
 	p.mutex.Unlock()
 
-	// We use two goroutines:
-	// 1) continuously reads stderr.
-	// 2) waits for the "ready" JSON message on stdout.
+	// We spin up goroutines to read stderr continuously and wait for ready signal on stdout.
 	p.wg.Add(2)
 	go func() {
 		defer p.wg.Done()
@@ -114,99 +106,94 @@ func (p *Process) Start() {
 	}
 }
 
-// Stop stops the process by sending a kill signal to the process and cleaning up the resources.
+// Stop stops the process by killing it and cleaning up resources.
 func (p *Process) Stop() {
 	p.SetReady(0)
 	if p.cmd != nil && p.cmd.Process != nil {
-		_ = p.cmd.Process.Kill()
+		p.cmd.Process.Kill()
 	}
 	p.wg.Wait()
 	p.cleanupChannelsAndResources()
 	p.logger.Info().Msgf("[nyxsub|%s] Process stopped", p.name)
 }
 
-// cleanupChannelsAndResources closes the pipes and resets the pointers.
+// cleanupChannelsAndResources closes the pipes and resets pointers.
 func (p *Process) cleanupChannelsAndResources() {
 	p.mutex.Lock()
-	defer p.mutex.Unlock()
-
 	if p.stdinPipe != nil {
-		_ = p.stdinPipe.Close()
+		p.stdinPipe.Close()
 		p.stdinPipe = nil
 	}
 	if p.stdoutPipe != nil {
-		_ = p.stdoutPipe.Close()
+		p.stdoutPipe.Close()
 		p.stdoutPipe = nil
 	}
 	if p.stderrPipe != nil {
-		_ = p.stderrPipe.Close()
+		p.stderrPipe.Close()
 		p.stderrPipe = nil
 	}
 	p.stdin = nil
 	p.stdout = nil
 	p.stderr = nil
 	p.cmd = nil
+	p.mutex.Unlock()
 }
 
-// Restart stops the process and starts it again.
+// Restart stops the process and starts it again, unless the pool is shutting down.
 func (p *Process) Restart() {
 	p.logger.Info().Msgf("[nyxsub|%s] Restarting process", p.name)
 	p.mutex.Lock()
 	p.restarts++
 	p.mutex.Unlock()
 	p.Stop()
-	// Only start again if the pool is not shutting down
+
 	if atomic.LoadInt32(&p.pool.shouldStop) == 0 {
 		p.Start()
 	}
 }
 
-// SetReady sets the readiness of the process.
+// SetReady sets the readiness of the process (1 = ready, 0 = not ready).
 func (p *Process) SetReady(ready int32) {
 	atomic.StoreInt32(&p.isReady, ready)
 }
 
-// IsReady checks if the process is ready.
+// IsReady checks if the process is ready (1) or not (0).
 func (p *Process) IsReady() bool {
 	return atomic.LoadInt32(&p.isReady) == 1
 }
 
-// IsBusy checks if the process is busy.
+// IsBusy checks if the process is busy (1) or not (0).
 func (p *Process) IsBusy() bool {
 	return atomic.LoadInt32(&p.isBusy) == 1
 }
 
-// SetBusy sets the busy status of the process.
+// SetBusy sets the busy status of the process (1 = busy, 0 = free).
 func (p *Process) SetBusy(busy int32) {
 	atomic.StoreInt32(&p.isBusy, busy)
 }
 
-// readStderr reads from stderr and logs any output.
+// readStderr reads from stderr and logs any output line-by-line.
 func (p *Process) readStderr() {
 	for {
 		line, err := p.stderr.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
-				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stderr", p.name)
+				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed reading stderr", p.name)
 			}
 			return
 		}
 		if line != "" && line != "\n" {
-			// Truncate long stderr lines to avoid massive logs
-			truncated := safeTruncate(line, 1024)
-			p.logger.Error().Msgf("[nyxsub|%s|stderr] %s", p.name, truncated)
+			p.logger.Error().Msgf("[nyxsub|%s|stderr] %s", p.name, line)
 		}
 	}
 }
 
-// WaitForReadyScan waits for the process to send a "ready" message (JSON with `"type": "ready"`).
-// Once that happens, we set the process as ready and return.
-// After this returns, we rely on readResponse for further reading from stdout.
+// WaitForReadyScan waits until the process sends a "ready" JSON message over stdout.
 func (p *Process) WaitForReadyScan() {
 	for {
 		line, err := p.stdout.ReadString('\n')
 		if err != nil {
-			p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout (waiting for ready)", p.name)
+			p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed reading stdout", p.name)
 			p.Restart()
 			return
 		}
@@ -216,9 +203,7 @@ func (p *Process) WaitForReadyScan() {
 
 		var response map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &response); err != nil {
-			// Truncate non-JSON logs so we don't flood
-			truncLine := safeTruncate(line, 1024)
-			p.logger.Warn().Msgf("[nyxsub|%s] Non-JSON message received while waiting for ready: '%s'", p.name, truncLine)
+			p.logger.Warn().Msgf("[nyxsub|%s] Non-JSON message: '%s'", p.name, line)
 			continue
 		}
 
@@ -230,7 +215,7 @@ func (p *Process) WaitForReadyScan() {
 	}
 }
 
-// SendCommand sends a command to the process and waits for the response.
+// SendCommand sends a command (as JSON) to the process and waits for the corresponding JSON response.
 func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
 	p.SetBusy(1)
 	defer p.SetBusy(0)
@@ -243,22 +228,15 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	}
 
 	startTime := time.Now()
-
-	// Send command
 	if err := p.stdin.Encode(cmd); err != nil {
 		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to send command", p.name)
 		p.Restart()
 		return nil, err
 	}
 
-	// Log the command sent (truncate if huge)
-	if p.logger.GetLevel() <= zerolog.DebugLevel {
-		jsonCmd, _ := json.Marshal(cmd)
-		truncated := safeTruncate(string(jsonCmd), 2048)
-		p.logger.Debug().Msgf("[nyxsub|%s] Command sent: %s", p.name, truncated)
-	}
+	// Log the command if in debug mode, but truncate big data
+	p.logCommandIfDebug(cmd)
 
-	// Wait for response
 	response, err := p.readResponse(cmd["id"].(string))
 	if err != nil {
 		p.Restart()
@@ -273,7 +251,7 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	return response, nil
 }
 
-// readResponse reads the response for a specific command ID.
+// readResponse reads lines from stdout until it finds the matching "id" in the JSON response or times out.
 func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 	timeout := time.After(p.timeout)
 
@@ -286,7 +264,7 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 		default:
 			line, err := p.stdout.ReadString('\n')
 			if err != nil {
-				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout (waiting for response)", p.name)
+				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
 				return nil, err
 			}
 			if line == "" || line == "\n" {
@@ -295,13 +273,10 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 
 			var response map[string]interface{}
 			if err := json.Unmarshal([]byte(line), &response); err != nil {
-				// Truncate big lines
-				truncLine := safeTruncate(line, 1024)
-				p.logger.Warn().Msgf("[nyxsub|%s] Non-JSON message received in response: '%s'", p.name, truncLine)
+				p.logger.Warn().Msgf("[nyxsub|%s] Non-JSON message: '%s'", p.name, line)
 				continue
 			}
 
-			// Check for matching response ID
 			if response["id"] == cmdID {
 				return response, nil
 			}
@@ -309,7 +284,27 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 	}
 }
 
-// ProcessPool is a pool of processes.
+// logCommandIfDebug logs the JSON command at debug level, but truncates large strings (e.g. big base64).
+func (p *Process) logCommandIfDebug(cmd map[string]interface{}) {
+	if p.logger.GetLevel() > zerolog.DebugLevel {
+		return
+	}
+	// Make a shallow copy so we can replace large strings without modifying the original
+	cloned := make(map[string]interface{}, len(cmd))
+	for k, v := range cmd {
+		if s, ok := v.(string); ok && len(s) > maxLogStringSize {
+			// Replace with truncated
+			cloned[k] = s[:maxLogStringSize] + "...(truncated)"
+		} else {
+			cloned[k] = v
+		}
+	}
+	if jsonCmd, err := json.Marshal(cloned); err == nil {
+		p.logger.Debug().Msgf("[nyxsub|%s] Command sent: %s", p.name, string(jsonCmd))
+	}
+}
+
+// ProcessPool is a pool of managed processes.
 type ProcessPool struct {
 	processes     []*Process
 	mutex         sync.RWMutex
@@ -322,7 +317,7 @@ type ProcessPool struct {
 	initTimeout   time.Duration
 }
 
-// NewProcessPool creates a new process pool.
+// NewProcessPool creates a new process pool of `size` processes running the specified command/args.
 func NewProcessPool(
 	name string,
 	size int,
@@ -334,40 +329,41 @@ func NewProcessPool(
 	comTimeout time.Duration,
 	initTimeout time.Duration,
 ) *ProcessPool {
-	shouldStop := int32(0)
 	pool := &ProcessPool{
 		processes:     make([]*Process, size),
 		logger:        logger,
 		mutex:         sync.RWMutex{},
-		shouldStop:    shouldStop,
+		shouldStop:    0,
 		stop:          make(chan bool, 1),
 		workerTimeout: workerTimeout,
 		comTimeout:    comTimeout,
 		initTimeout:   initTimeout,
 	}
+
 	pool.queue = ProcessPQ{
 		processes: make([]*ProcessWithPrio, 0),
 		mutex:     sync.Mutex{},
 		pool:      pool,
 	}
+
 	for i := 0; i < size; i++ {
 		pool.newProcess(name, i, cmd, cmdArgs, logger, cwd)
 	}
 	return pool
 }
 
-// SetShouldStop sets the shouldStop flag.
+// SetShouldStop sets the atomic "shouldStop" flag.
 func (pool *ProcessPool) SetShouldStop(ready int32) {
 	atomic.StoreInt32(&pool.shouldStop, ready)
 }
 
-// SetStop signals the pool to stop and sets the shouldStop flag.
+// SetStop signals the pool to stop (and stops all processes).
 func (pool *ProcessPool) SetStop() {
 	pool.SetShouldStop(1)
 	pool.stop <- true
 }
 
-// newProcess creates a new process in the process pool.
+// newProcess initializes a single worker process in the pool.
 func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []string, logger *zerolog.Logger, cwd string) {
 	pool.mutex.Lock()
 	pool.processes[i] = &Process{
@@ -385,13 +381,12 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 		cwd:             cwd,
 		pool:            pool,
 	}
-	proc := pool.processes[i]
 	pool.mutex.Unlock()
 
-	proc.Start()
+	pool.processes[i].Start()
 }
 
-// ExportAll exports all the processes in the process pool as a slice of ProcessExport.
+// ExportAll returns a snapshot of ProcessExport data for each process in the pool.
 func (pool *ProcessPool) ExportAll() []ProcessExport {
 	pool.mutex.RLock()
 	defer pool.mutex.RUnlock()
@@ -413,7 +408,7 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 	return exports
 }
 
-// GetWorker returns a worker process from the process pool.
+// GetWorker returns a ready, non-busy worker from the pool or times out.
 func (pool *ProcessPool) GetWorker() (*Process, error) {
 	timeoutTimer := time.After(pool.workerTimeout)
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -422,60 +417,59 @@ func (pool *ProcessPool) GetWorker() (*Process, error) {
 	for {
 		select {
 		case <-timeoutTimer:
-			return nil, fmt.Errorf("timeout waiting for worker")
+			return nil, fmt.Errorf("timeout exceeded, no available workers")
 
 		case <-ticker.C:
-			// Build or update the process queue under one lock
+			// Lock once to rebuild + pop from the PQ
 			pool.queue.mutex.Lock()
 
-			// Clear out any old data in pq.processes
+			// Reuse underlying slice memory by slicing to zero length
 			pool.queue.processes = pool.queue.processes[:0]
 
-			// RLock the pool to safely iterate
+			// Collect all ready/free processes
 			pool.mutex.RLock()
-			for _, process := range pool.processes {
-				if process != nil && process.IsReady() && !process.IsBusy() {
+			for _, proc := range pool.processes {
+				if proc != nil && proc.IsReady() && !proc.IsBusy() {
 					pool.queue.Push(&ProcessWithPrio{
-						processId: process.id,
-						handled:   process.requestsHandled,
+						processId: proc.id,
+						handled:   proc.requestsHandled,
 					})
 				}
 			}
 			pool.mutex.RUnlock()
 
-			// Re-heapify after rebuilding the slice
+			// Re-heapify
 			heap.Init(&pool.queue)
 
-			// If we have an available worker, pop one
+			// If we have an available worker, pop one and return it
 			if pool.queue.Len() > 0 {
-				processWithPrio := heap.Pop(&pool.queue).(*ProcessWithPrio)
+				popped := heap.Pop(&pool.queue).(*ProcessWithPrio)
 				pool.queue.mutex.Unlock()
 
-				// Mark that worker as busy
-				worker := pool.processes[processWithPrio.processId]
-				worker.SetBusy(1)
-				return worker, nil
+				pool.processes[popped.processId].SetBusy(1)
+				return pool.processes[popped.processId], nil
 			}
+
 			pool.queue.mutex.Unlock()
 		}
 	}
 }
 
-// WaitForReady waits until at least one worker is ready or times out.
+// WaitForReady waits until at least one process is ready, or times out after initTimeout.
 func (pool *ProcessPool) WaitForReady() error {
 	start := time.Now()
 	for {
 		pool.mutex.RLock()
-		ready := false
-		for _, process := range pool.processes {
-			if process != nil && atomic.LoadInt32(&process.isReady) == 1 {
-				ready = true
+		readyFound := false
+		for _, proc := range pool.processes {
+			if proc != nil && proc.IsReady() {
+				readyFound = true
 				break
 			}
 		}
 		pool.mutex.RUnlock()
 
-		if ready {
+		if readyFound {
 			return nil
 		}
 		if time.Since(start) > pool.initTimeout {
@@ -485,7 +479,7 @@ func (pool *ProcessPool) WaitForReady() error {
 	}
 }
 
-// SendCommand sends a command to a worker in the process pool.
+// SendCommand gets a worker from the pool and sends the command to it.
 func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
 	worker, err := pool.GetWorker()
 	if err != nil {
@@ -494,66 +488,57 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 	return worker.SendCommand(cmd)
 }
 
-// StopAll stops all the processes in the process pool.
+// StopAll stops all processes in the pool.
 func (pool *ProcessPool) StopAll() {
 	pool.SetStop()
-	// Gracefully stop each worker
-	pool.mutex.RLock()
-	defer pool.mutex.RUnlock()
-	for _, process := range pool.processes {
-		if process != nil {
-			process.Stop()
+	for _, proc := range pool.processes {
+		if proc != nil {
+			proc.Stop()
 		}
 	}
 }
 
+// ProcessWithPrio is used by the priority queue to select the least-busy worker.
 type ProcessWithPrio struct {
 	processId int
 	handled   int
 }
 
+// ProcessPQ is our priority queue (min-heap) of ProcessWithPrio items.
 type ProcessPQ struct {
 	processes []*ProcessWithPrio
 	mutex     sync.Mutex
 	pool      *ProcessPool
 }
 
-// Below are standard heap.Interface methods for ProcessPQ
 func (pq *ProcessPQ) Len() int {
 	return len(pq.processes)
 }
-
 func (pq *ProcessPQ) Less(i, j int) bool {
 	return pq.processes[i].handled < pq.processes[j].handled
 }
-
 func (pq *ProcessPQ) Swap(i, j int) {
 	pq.processes[i], pq.processes[j] = pq.processes[j], pq.processes[i]
 }
-
 func (pq *ProcessPQ) Push(x interface{}) {
 	item := x.(*ProcessWithPrio)
 	pq.processes = append(pq.processes, item)
 }
-
 func (pq *ProcessPQ) Pop() interface{} {
 	old := pq.processes
 	n := len(old)
 	item := old[n-1]
-	pq.processes = old[0 : n-1]
+	pq.processes = old[:n-1]
 	return item
 }
 
-// Update is a convenience method if you want to do a refresh of the PQ.
+// Update is left unchanged; only used if needed externally.
 func (pq *ProcessPQ) Update() {
 	pq.mutex.Lock()
 	defer pq.mutex.Unlock()
 
 	pq.processes = pq.processes[:0]
-
 	pq.pool.mutex.RLock()
-	defer pq.pool.mutex.RUnlock()
-
 	for _, process := range pq.pool.processes {
 		if process != nil && process.IsReady() && !process.IsBusy() {
 			pq.Push(&ProcessWithPrio{
@@ -562,5 +547,7 @@ func (pq *ProcessPQ) Update() {
 			})
 		}
 	}
+	pq.pool.mutex.RUnlock()
+
 	heap.Init(pq)
 }
