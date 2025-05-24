@@ -24,6 +24,7 @@ type Process struct {
 	isBusy          int32
 	latency         int64
 	mutex           sync.RWMutex
+	commandMutex    sync.Mutex    // Mutex for command send/receive operations
 	logger          *zerolog.Logger
 	stdin           *json.Encoder
 	stdout          *bufio.Reader
@@ -149,7 +150,17 @@ func (p *Process) Restart() {
 
 // SetReady sets the readiness of the process.
 func (p *Process) SetReady(ready int32) {
-	atomic.StoreInt32(&p.isReady, ready)
+	wasReady := atomic.SwapInt32(&p.isReady, ready)
+	// If transitioning to ready and not busy, add to available workers
+	if wasReady == 0 && ready == 1 && !p.IsBusy() && p.pool != nil && atomic.LoadInt32(&p.pool.shouldStop) == 0 {
+		select {
+		case p.pool.availableWorkers <- p:
+			// Successfully added to channel
+		default:
+			// Channel is full, should not happen with proper buffer size
+			p.logger.Warn().Msgf("[nyxsub|%s] Available workers channel is full", p.name)
+		}
+	}
 }
 
 // IsReady checks if the process is ready.
@@ -164,7 +175,17 @@ func (p *Process) IsBusy() bool {
 
 // SetBusy sets the busy status of the process.
 func (p *Process) SetBusy(busy int32) {
-	atomic.StoreInt32(&p.isBusy, busy)
+	wasbusy := atomic.SwapInt32(&p.isBusy, busy)
+	// If transitioning from busy to not busy, and process is ready, add to available workers
+	if wasbusy == 1 && busy == 0 && p.IsReady() && p.pool != nil && atomic.LoadInt32(&p.pool.shouldStop) == 0 {
+		select {
+		case p.pool.availableWorkers <- p:
+			// Successfully added to channel
+		default:
+			// Channel is full, should not happen with proper buffer size
+			p.logger.Warn().Msgf("[nyxsub|%s] Available workers channel is full", p.name)
+		}
+	}
 }
 
 // readStderr reads from stderr and logs any output.
@@ -223,6 +244,10 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	}
 
 	start := time.Now().UnixMilli()
+
+	// Lock for command operations to prevent concurrent access to stdin/stdout
+	p.commandMutex.Lock()
+	defer p.commandMutex.Unlock()
 
 	// Send command
 	if err := p.stdin.Encode(cmd); err != nil {
@@ -288,12 +313,12 @@ type ProcessPool struct {
 	processes     []*Process
 	mutex         sync.RWMutex
 	logger        *zerolog.Logger
-	queue         ProcessPQ
 	shouldStop    int32
 	stop          chan bool
 	workerTimeout time.Duration
 	comTimeout    time.Duration
 	initTimeout   time.Duration
+	availableWorkers chan *Process // Channel for available workers
 }
 
 // NewProcessPool creates a new process pool.
@@ -318,8 +343,9 @@ func NewProcessPool(
 		workerTimeout: workerTimeout,
 		comTimeout:    comTimeout,
 		initTimeout:   initTimeout,
+		availableWorkers: make(chan *Process, size), // Buffer size = number of workers
 	}
-	pool.queue = ProcessPQ{processes: make([]*ProcessWithPrio, 0), mutex: sync.Mutex{}, pool: pool}
+	// Priority queue no longer needed with channel-based approach
 	for i := 0; i < size; i++ {
 		pool.newProcess(name, i, cmd, cmdArgs, logger, cwd)
 	}
@@ -384,27 +410,35 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 // GetWorker returns a worker process from the process pool.
 func (pool *ProcessPool) GetWorker() (*Process, error) {
 	timeoutTimer := time.After(pool.workerTimeout)
-	ticker := time.NewTicker(time.Millisecond * 100)
+	ticker := time.NewTicker(time.Millisecond * 10) // Much faster ticker for fallback
 	defer ticker.Stop()
 
 	for {
 		select {
+		case worker, ok := <-pool.availableWorkers:
+			if !ok {
+				// Channel is closed, pool is stopping
+				return nil, fmt.Errorf("pool is stopping")
+			}
+			// Worker was available in the channel
+			worker.SetBusy(1)
+			return worker, nil
+		case <-ticker.C:
+			// Fallback: check if any workers are available that weren't in the channel
+			// This handles initialization and edge cases
+			pool.mutex.RLock()
+			for _, process := range pool.processes {
+				if process != nil && process.IsReady() && !process.IsBusy() {
+					// Try to mark as busy atomically
+					if atomic.CompareAndSwapInt32(&process.isBusy, 0, 1) {
+						pool.mutex.RUnlock()
+						return process, nil
+					}
+				}
+			}
+			pool.mutex.RUnlock()
 		case <-timeoutTimer:
 			return nil, fmt.Errorf("timeout exceeded, no available workers")
-		case <-ticker.C:
-			// First, update the queue (this locks/unlocks internally).
-			pool.queue.Update()
-
-			// Now lock around checking length and popping.
-			pool.queue.mutex.Lock()
-			if pool.queue.Len() > 0 {
-				processWithPrio := heap.Pop(&pool.queue).(*ProcessWithPrio)
-				pool.queue.mutex.Unlock()
-
-				pool.processes[processWithPrio.processId].SetBusy(1)
-				return pool.processes[processWithPrio.processId], nil
-			}
-			pool.queue.mutex.Unlock()
 		}
 	}
 }
@@ -446,6 +480,12 @@ func (pool *ProcessPool) StopAll() {
 	pool.SetStop()
 	for _, process := range pool.processes {
 		process.Stop()
+	}
+	// Close the channel after stopping all processes
+	close(pool.availableWorkers)
+	// Drain any remaining entries
+	for range pool.availableWorkers {
+		// Drain channel
 	}
 }
 
