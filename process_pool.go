@@ -68,11 +68,14 @@ func (p *Process) Start() {
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
 		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to get stdout pipe for process", p.name)
+		stdinPipe.Close()
 		return
 	}
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to get stderr pipe for process", p.name)
+		stdinPipe.Close()
+		stdoutPipe.Close()
 		return
 	}
 
@@ -86,6 +89,27 @@ func (p *Process) Start() {
 	p.stderr = bufio.NewReader(stderrPipe)
 	p.mutex.Unlock()
 
+	p.cmd.Dir = p.cwd
+	if err := p.cmd.Start(); err != nil {
+		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to start process", p.name)
+		// Clean up pipes on start failure
+		stdinPipe.Close()
+		stdoutPipe.Close()
+		stderrPipe.Close()
+		// Reset the stored references
+		p.mutex.Lock()
+		p.cmd = nil
+		p.stdinPipe = nil
+		p.stdoutPipe = nil
+		p.stderrPipe = nil
+		p.stdin = nil
+		p.stdout = nil
+		p.stderr = nil
+		p.mutex.Unlock()
+		return
+	}
+
+	// Only start goroutines after process successfully starts
 	p.wg.Add(2)
 	go func() {
 		defer p.wg.Done()
@@ -95,12 +119,6 @@ func (p *Process) Start() {
 		defer p.wg.Done()
 		p.WaitForReadyScan()
 	}()
-
-	p.cmd.Dir = p.cwd
-	if err := p.cmd.Start(); err != nil {
-		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to start process", p.name)
-		return
-	}
 }
 
 // Stop stops the process by sending a kill signal to the process and cleaning up the resources.
@@ -209,8 +227,17 @@ func (p *Process) WaitForReadyScan() {
 	for {
 		line, err := p.stdout.ReadString('\n')
 		if err != nil {
-			p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
-			p.Restart()
+			if err != io.EOF {
+				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
+			}
+			// Signal that the process needs restart by marking it as not ready
+			p.SetReady(0)
+			// Schedule restart asynchronously to avoid goroutine leak
+			if atomic.LoadInt32(&p.pool.shouldStop) == 0 {
+				go func() {
+					p.Restart()
+				}()
+			}
 			return
 		}
 		if line == "" || line == "\n" {
@@ -247,11 +274,11 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 	// Lock for command operations to prevent concurrent access to stdin/stdout
 	p.commandMutex.Lock()
-	defer p.commandMutex.Unlock()
 
 	// Send command
 	if err := p.stdin.Encode(cmd); err != nil {
 		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to send command", p.name)
+		p.commandMutex.Unlock()
 		p.Restart()
 		return nil, err
 	}
@@ -262,6 +289,7 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 	// Wait for response
 	response, err := p.readResponse(cmd["id"].(string))
+	p.commandMutex.Unlock()
 	if err != nil {
 		p.Restart()
 		return nil, err
@@ -277,11 +305,12 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 // readResponse reads the response for a specific command ID.
 func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
-	timeout := time.After(p.timeout)
+	timer := time.NewTimer(p.timeout)
+	defer timer.Stop()
 
 	for {
 		select {
-		case <-timeout:
+		case <-timer.C:
 			p.logger.Error().Msgf("[nyxsub|%s] Communication timed out", p.name)
 			return nil, errors.New("communication timed out")
 		default:
@@ -487,6 +516,8 @@ func (pool *ProcessPool) StopAll() {
 	for range pool.availableWorkers {
 		// Drain channel
 	}
+	// Close the stop channel
+	close(pool.stop)
 }
 
 type ProcessWithPrio struct {
