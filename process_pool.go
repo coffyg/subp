@@ -22,6 +22,7 @@ type Process struct {
 	cmd             *exec.Cmd
 	isReady         int32
 	isBusy          int32
+	isRestarting    int32  // Flag to prevent concurrent restarts
 	latency         int64
 	mutex           sync.RWMutex
 	commandMutex    sync.Mutex    // Mutex for command send/receive operations
@@ -156,6 +157,14 @@ func (p *Process) cleanupChannelsAndResources() {
 
 // Restart stops the process and starts it again.
 func (p *Process) Restart() {
+	// Prevent concurrent restarts using atomic compare-and-swap
+	if !atomic.CompareAndSwapInt32(&p.isRestarting, 0, 1) {
+		// Another restart is already in progress
+		p.logger.Debug().Msgf("[nyxsub|%s] Restart already in progress, skipping", p.name)
+		return
+	}
+	defer atomic.StoreInt32(&p.isRestarting, 0)
+	
 	p.logger.Info().Msgf("[nyxsub|%s] Restarting process", p.name)
 	p.mutex.Lock()
 	p.restarts++
@@ -232,12 +241,8 @@ func (p *Process) WaitForReadyScan() {
 			}
 			// Signal that the process needs restart by marking it as not ready
 			p.SetReady(0)
-			// Schedule restart asynchronously to avoid goroutine leak
-			if atomic.LoadInt32(&p.pool.shouldStop) == 0 {
-				go func() {
-					p.Restart()
-				}()
-			}
+			// Simply return and let the process be restarted when needed
+			// The process will be restarted by SendCommand when it fails
 			return
 		}
 		if line == "" || line == "\n" {
@@ -402,6 +407,8 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 	pool.mutex.Lock()
 	pool.processes[i] = &Process{
 		isReady:         0,
+		isBusy:          0,
+		isRestarting:    0,
 		latency:         0,
 		logger:          logger,
 		name:            fmt.Sprintf("%s#%d", name, i),
