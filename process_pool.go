@@ -278,6 +278,8 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	// Send command
 	if err := p.stdin.Encode(cmd); err != nil {
 		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to send command", p.name)
+		// Mark as not ready before unlocking to prevent new commands
+		p.SetReady(0)
 		p.commandMutex.Unlock()
 		p.Restart()
 		return nil, err
@@ -289,11 +291,14 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 
 	// Wait for response
 	response, err := p.readResponse(cmd["id"].(string))
-	p.commandMutex.Unlock()
 	if err != nil {
+		// Mark as not ready before unlocking to prevent new commands
+		p.SetReady(0)
+		p.commandMutex.Unlock()
 		p.Restart()
 		return nil, err
 	}
+	p.commandMutex.Unlock()
 
 	p.mutex.Lock()
 	p.latency = time.Now().UnixMilli() - start
