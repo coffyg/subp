@@ -22,10 +22,10 @@ type Process struct {
 	cmd             *exec.Cmd
 	isReady         int32
 	isBusy          int32
-	isRestarting    int32  // Flag to prevent concurrent restarts
+	isRestarting    int32 // Flag to prevent concurrent restarts
 	latency         int64
 	mutex           sync.RWMutex
-	commandMutex    sync.Mutex    // Mutex for command send/receive operations
+	commandMutex    sync.Mutex // Mutex for command send/receive operations
 	logger          *zerolog.Logger
 	stdin           *json.Encoder
 	stdout          *bufio.Reader
@@ -164,7 +164,7 @@ func (p *Process) Restart() {
 		return
 	}
 	defer atomic.StoreInt32(&p.isRestarting, 0)
-	
+
 	p.logger.Info().Msgf("[nyxsub|%s] Restarting process", p.name)
 	p.mutex.Lock()
 	p.restarts++
@@ -349,14 +349,14 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 
 // ProcessPool is a pool of processes.
 type ProcessPool struct {
-	processes     []*Process
-	mutex         sync.RWMutex
-	logger        *zerolog.Logger
-	shouldStop    int32
-	stop          chan bool
-	workerTimeout time.Duration
-	comTimeout    time.Duration
-	initTimeout   time.Duration
+	processes        []*Process
+	mutex            sync.RWMutex
+	logger           *zerolog.Logger
+	shouldStop       int32
+	stop             chan bool
+	workerTimeout    time.Duration
+	comTimeout       time.Duration
+	initTimeout      time.Duration
 	availableWorkers chan *Process // Channel for available workers
 }
 
@@ -374,14 +374,14 @@ func NewProcessPool(
 ) *ProcessPool {
 	shouldStop := int32(0)
 	pool := &ProcessPool{
-		processes:     make([]*Process, size),
-		logger:        logger,
-		mutex:         sync.RWMutex{},
-		shouldStop:    shouldStop,
-		stop:          make(chan bool, 1),
-		workerTimeout: workerTimeout,
-		comTimeout:    comTimeout,
-		initTimeout:   initTimeout,
+		processes:        make([]*Process, size),
+		logger:           logger,
+		mutex:            sync.RWMutex{},
+		shouldStop:       shouldStop,
+		stop:             make(chan bool, 1),
+		workerTimeout:    workerTimeout,
+		comTimeout:       comTimeout,
+		initTimeout:      initTimeout,
 		availableWorkers: make(chan *Process, size), // Buffer size = number of workers
 	}
 	// Priority queue no longer needed with channel-based approach
@@ -481,6 +481,28 @@ func (pool *ProcessPool) GetWorker() (*Process, error) {
 		case <-timeoutTimer:
 			return nil, fmt.Errorf("timeout exceeded, no available workers")
 		}
+	}
+}
+
+func (pool *ProcessPool) WaitForReadyAllProcess() error {
+	start := time.Now()
+	for {
+		pool.mutex.RLock()
+		ready := true
+		for _, process := range pool.processes {
+			if process != nil && atomic.LoadInt32(&process.isReady) == 0 {
+				ready = false
+				break
+			}
+		}
+		pool.mutex.RUnlock()
+		if ready {
+			return nil
+		}
+		if time.Since(start) > pool.initTimeout {
+			return fmt.Errorf("timeout waiting for all workers to be ready")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
