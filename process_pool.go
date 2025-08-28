@@ -385,6 +385,7 @@ type ProcessPool struct {
 	initTimeout      time.Duration
 	availableWorkers chan *Process // Channel for available workers
 	commandToProcess map[string]*Process // Track which process is handling which command ID
+	cancelledCommands map[string]bool // Track cancelled command IDs
 }
 
 // NewProcessPool creates a new process pool.
@@ -411,6 +412,7 @@ func NewProcessPool(
 		initTimeout:      initTimeout,
 		availableWorkers: make(chan *Process, size), // Buffer size = number of workers
 		commandToProcess: make(map[string]*Process),
+		cancelledCommands: make(map[string]bool),
 	}
 	// Create all processes first (without starting them)
 	for i := 0; i < size; i++ {
@@ -593,8 +595,19 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 		return nil, err
 	}
 	
-	// Update tracking to show which worker is handling this command
+	// Check if command was cancelled while waiting for worker
 	pool.mutex.Lock()
+	if pool.cancelledCommands[cmdID] {
+		// Command was cancelled, clean up and return error
+		delete(pool.commandToProcess, cmdID)
+		delete(pool.cancelledCommands, cmdID)
+		pool.mutex.Unlock()
+		// Release worker back to pool
+		worker.SetBusy(0)
+		return nil, fmt.Errorf("command %s was interrupted while queued", cmdID)
+	}
+	
+	// Update tracking to show which worker is handling this command
 	pool.commandToProcess[cmdID] = worker
 	pool.mutex.Unlock()
 	
@@ -604,6 +617,7 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 	// Clean up tracking on completion (worker.SendCommand also cleans up, but this ensures it)
 	pool.mutex.Lock()
 	delete(pool.commandToProcess, cmdID)
+	delete(pool.cancelledCommands, cmdID) // Clean up any cancelled flag
 	pool.mutex.Unlock()
 	
 	return response, execErr
@@ -611,29 +625,37 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 
 // Interrupt sends an interrupt signal to the process handling the specified command ID.
 func (pool *ProcessPool) Interrupt(id string) error {
-	pool.mutex.RLock()
+	pool.mutex.Lock()
+	defer pool.mutex.Unlock()
+	
 	process, exists := pool.commandToProcess[id]
-	pool.mutex.RUnlock()
 	
 	if !exists {
 		return fmt.Errorf("no command found with ID: %s", id)
 	}
 	
-	// If process is nil, command is queued but not yet executing
+	// If process is nil, command is queued but not yet executing - mark as cancelled
 	if process == nil {
-		return fmt.Errorf("command %s is queued, cannot interrupt until executing", id)
+		pool.cancelledCommands[id] = true
+		return nil // Successfully cancelled queued command
 	}
 	
-	// Send interrupt message directly to the process
+	// Command is executing, send interrupt message directly to the process
 	interruptCmd := map[string]interface{}{
 		"interrupt": "²INTERUPT²",
 	}
+	
+	// Temporarily unlock to avoid deadlock with process mutex
+	pool.mutex.Unlock()
 	
 	// We need to send this directly without going through SendCommand
 	// to avoid blocking or interfering with the active command
 	process.commandMutex.Lock()
 	err := process.stdin.Encode(interruptCmd)
 	process.commandMutex.Unlock()
+	
+	// Relock for defer unlock
+	pool.mutex.Lock()
 	
 	if err != nil {
 		return fmt.Errorf("failed to send interrupt to process %s: %w", process.name, err)
