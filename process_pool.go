@@ -43,9 +43,10 @@ type Process struct {
 	wg              sync.WaitGroup
 
 	// Added fields
-	stdinPipe  io.WriteCloser
-	stdoutPipe io.ReadCloser
-	stderrPipe io.ReadCloser
+	stdinPipe       io.WriteCloser
+	stdoutPipe      io.ReadCloser
+	stderrPipe      io.ReadCloser
+	activeCommandID string // Currently executing command ID
 }
 
 // ProcessExport exports process information.
@@ -280,9 +281,15 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	// Lock for command operations to prevent concurrent access to stdin/stdout
 	p.commandMutex.Lock()
 
+	// Track active command
+	cmdID := cmd["id"].(string)
+	p.activeCommandID = cmdID
+
 	// Send command
 	if err := p.stdin.Encode(cmd); err != nil {
 		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to send command", p.name)
+		// Clean up local command tracking
+		p.activeCommandID = ""
 		// Mark as not ready before unlocking to prevent new commands
 		p.SetReady(0)
 		p.commandMutex.Unlock()
@@ -297,12 +304,17 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	// Wait for response
 	response, err := p.readResponse(cmd["id"].(string))
 	if err != nil {
+		// Clean up local command tracking
+		p.activeCommandID = ""
 		// Mark as not ready before unlocking to prevent new commands
 		p.SetReady(0)
 		p.commandMutex.Unlock()
 		p.Restart()
 		return nil, err
 	}
+	
+	// Clean up local command tracking on successful completion
+	p.activeCommandID = ""
 	p.commandMutex.Unlock()
 
 	p.mutex.Lock()
@@ -311,6 +323,20 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	p.mutex.Unlock()
 
 	return response, nil
+}
+
+// WaitForReady waits until this specific process is ready or times out.
+func (p *Process) WaitForReady() error {
+	start := time.Now()
+	for {
+		if atomic.LoadInt32(&p.isReady) == 1 {
+			return nil
+		}
+		if time.Since(start) > p.initTimeout {
+			return fmt.Errorf("timeout waiting for process %s to be ready", p.name)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // readResponse reads the response for a specific command ID.
@@ -358,6 +384,7 @@ type ProcessPool struct {
 	comTimeout       time.Duration
 	initTimeout      time.Duration
 	availableWorkers chan *Process // Channel for available workers
+	commandToProcess map[string]*Process // Track which process is handling which command ID
 }
 
 // NewProcessPool creates a new process pool.
@@ -383,11 +410,22 @@ func NewProcessPool(
 		comTimeout:       comTimeout,
 		initTimeout:      initTimeout,
 		availableWorkers: make(chan *Process, size), // Buffer size = number of workers
+		commandToProcess: make(map[string]*Process),
 	}
-	// Priority queue no longer needed with channel-based approach
+	// Create all processes first (without starting them)
 	for i := 0; i < size; i++ {
 		pool.newProcess(name, i, cmd, cmdArgs, logger, cwd)
 	}
+	
+	// Start processes sequentially and wait for each to be ready
+	for i := 0; i < size; i++ {
+		pool.processes[i].Start()
+		if err := pool.processes[i].WaitForReady(); err != nil {
+			logger.Error().Err(err).Msgf("Failed to start process %s", pool.processes[i].name)
+			// Continue with other processes even if one fails
+		}
+	}
+	
 	return pool
 }
 
@@ -423,7 +461,7 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 		pool:            pool,
 	}
 	pool.mutex.Unlock()
-	pool.processes[i].Start()
+	// Start() will be called manually in NewProcessPool for sequential startup
 }
 
 // ExportAll exports all the processes in the process pool as a slice of ProcessExport.
@@ -531,11 +569,77 @@ func (pool *ProcessPool) WaitForReady() error {
 
 // SendCommand sends a command to a worker in the process pool.
 func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
+	// Extract or assign command ID first
+	var cmdID string
+	if id, ok := cmd["id"]; ok {
+		cmdID = id.(string)
+	} else {
+		cmdID = uuid.New().String()
+		cmd["id"] = cmdID
+	}
+	
+	// Track command as queued before getting worker
+	pool.mutex.Lock()
+	pool.commandToProcess[cmdID] = nil // nil means queued, waiting for worker
+	pool.mutex.Unlock()
+	
+	// Try to get worker
 	worker, err := pool.GetWorker()
 	if err != nil {
+		// Clean up if couldn't get worker
+		pool.mutex.Lock()
+		delete(pool.commandToProcess, cmdID)
+		pool.mutex.Unlock()
 		return nil, err
 	}
-	return worker.SendCommand(cmd)
+	
+	// Update tracking to show which worker is handling this command
+	pool.mutex.Lock()
+	pool.commandToProcess[cmdID] = worker
+	pool.mutex.Unlock()
+	
+	// Execute command - worker.SendCommand will handle the rest of tracking
+	response, execErr := worker.SendCommand(cmd)
+	
+	// Clean up tracking on completion (worker.SendCommand also cleans up, but this ensures it)
+	pool.mutex.Lock()
+	delete(pool.commandToProcess, cmdID)
+	pool.mutex.Unlock()
+	
+	return response, execErr
+}
+
+// Interrupt sends an interrupt signal to the process handling the specified command ID.
+func (pool *ProcessPool) Interrupt(id string) error {
+	pool.mutex.RLock()
+	process, exists := pool.commandToProcess[id]
+	pool.mutex.RUnlock()
+	
+	if !exists {
+		return fmt.Errorf("no command found with ID: %s", id)
+	}
+	
+	// If process is nil, command is queued but not yet executing
+	if process == nil {
+		return fmt.Errorf("command %s is queued, cannot interrupt until executing", id)
+	}
+	
+	// Send interrupt message directly to the process
+	interruptCmd := map[string]interface{}{
+		"interrupt": "²INTERUPT²",
+	}
+	
+	// We need to send this directly without going through SendCommand
+	// to avoid blocking or interfering with the active command
+	process.commandMutex.Lock()
+	err := process.stdin.Encode(interruptCmd)
+	process.commandMutex.Unlock()
+	
+	if err != nil {
+		return fmt.Errorf("failed to send interrupt to process %s: %w", process.name, err)
+	}
+	
+	return nil
 }
 
 // StopAll stops all the processes in the process pool.
