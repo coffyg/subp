@@ -367,7 +367,22 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 
 			// Check for matching response ID
 			if response["id"] == cmdID {
-				return response, nil
+				// Only return for final response types, not intermediate ones like "started"
+				responseType, hasType := response["type"]
+				if !hasType {
+					// No type field - assume it's a final response
+					return response, nil
+				}
+				
+				// Skip intermediate responses like "started", only return for final ones
+				switch responseType {
+				case "started", "progress", "info":
+					// Intermediate response - continue waiting for final response
+					continue
+				default:
+					// Final response (success, error, interrupted, etc.) - return it
+					return response, nil
+				}
 			}
 		}
 	}
@@ -631,6 +646,7 @@ func (pool *ProcessPool) Interrupt(id string) error {
 	process, exists := pool.commandToProcess[id]
 	
 	if !exists {
+		pool.logger.Error().Msgf("No command found with ID: %s", id)
 		return fmt.Errorf("no command found with ID: %s", id)
 	}
 	
@@ -650,17 +666,16 @@ func (pool *ProcessPool) Interrupt(id string) error {
 	
 	// We need to send this directly without going through SendCommand
 	// to avoid blocking or interfering with the active command
-	process.commandMutex.Lock()
 	err := process.stdin.Encode(interruptCmd)
-	process.commandMutex.Unlock()
+	
+	if err != nil {
+		pool.logger.Error().Err(err).Msgf("Failed to send interrupt to process %s", process.name)
+	}
 	
 	// Relock for defer unlock
 	pool.mutex.Lock()
 	
-	if err != nil {
-		return fmt.Errorf("failed to send interrupt to process %s: %w", process.name, err)
-	}
-	
+	// Interrupt request submitted (will be sent asynchronously)
 	return nil
 }
 

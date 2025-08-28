@@ -232,9 +232,502 @@ func TestSequentialStartup(t *testing.T) {
 	}
 }
 
-// TODO: TestInterrupt - comprehensive testing of interrupt functionality 
-// Basic interrupt API is implemented and working:
-// - pool.Interrupt(id) sends {"interrupt": "²INTERUPT²"} to executing commands
-// - pool.Interrupt(id) marks queued commands as cancelled  
-// - Cancelled queued commands return error when they get a worker
-// This satisfies the requirements - full integration testing can be added later
+// TestInterrupt tests the interrupt functionality for executing commands.
+func TestInterrupt(t *testing.T) {
+	// Create a temporary directory for the test worker program.
+	tmpDir, err := os.MkdirTemp("", "interrupt_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Write a test worker program that can handle interrupts and long-running commands
+	workerProgram := `
+	package main
+	
+	import (
+		"bufio"
+		"encoding/json"
+		"os"
+		"time"
+	)
+	
+	var (
+		currentTaskID   string
+		interrupted     bool
+		msgChan         = make(chan map[string]interface{}, 10)
+	)
+	
+	func main() {
+		// Send a ready message to indicate the process is ready.
+		readyMsg := map[string]interface{}{"type": "ready"}
+		json.NewEncoder(os.Stdout).Encode(readyMsg)
+	
+		// Start message reader goroutine
+		go func() {
+			scanner := bufio.NewScanner(os.Stdin)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if line == "" {
+					continue
+				}
+		
+				var cmd map[string]interface{}
+				err := json.Unmarshal([]byte(line), &cmd)
+				if err != nil {
+					continue
+				}
+				msgChan <- cmd
+			}
+		}()
+	
+		// Main message processing loop
+		for cmd := range msgChan {
+			// Check for interrupt command
+			if interrupt, ok := cmd["interrupt"]; ok && interrupt == "²INTERUPT²" {
+				// Debug: log interrupt received
+				json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+					"debug": "interrupt received",
+					"currentTaskID": currentTaskID,
+				})
+				if currentTaskID != "" {
+					interrupted = true
+				}
+				continue
+			}
+	
+			// Handle regular commands
+			currentTaskID = cmd["id"].(string)
+			interrupted = false
+			
+			// Check if this is a long-running command
+			if duration, ok := cmd["sleep"]; ok {
+				sleepTime := time.Duration(duration.(float64)) * time.Millisecond
+				
+				// Start processing and signal we've started
+				startMsg := map[string]interface{}{
+					"type": "started",
+					"id": cmd["id"],
+				}
+				json.NewEncoder(os.Stdout).Encode(startMsg)
+				
+				// Sleep with proper interrupt handling using select
+				timer := time.NewTimer(sleepTime)
+				
+				select {
+				case <-timer.C:
+					// Sleep completed normally
+					json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+						"debug": "sleep completed normally",
+						"taskID": cmd["id"],
+					})
+					interrupted = false
+				case interruptCmd := <-msgChan:
+					timer.Stop()
+					json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+						"debug": "got message during sleep",
+						"msg": interruptCmd,
+					})
+					if interrupt, ok := interruptCmd["interrupt"]; ok && interrupt == "²INTERUPT²" {
+						interrupted = true
+					} else {
+						// Got another command during sleep - ignore it
+						interrupted = false
+					}
+				}
+				
+				if interrupted {
+					// Task was interrupted - send interrupted response
+					response := map[string]interface{}{
+						"type":    "interrupted", 
+						"id":      cmd["id"],
+						"message": "task was interrupted",
+					}
+					json.NewEncoder(os.Stdout).Encode(response)
+					currentTaskID = ""
+					continue
+				}
+			} else {
+				// Regular quick command - simulate processing time
+				time.Sleep(100 * time.Millisecond)
+				
+				if interrupted {
+					// Quick task interrupted
+					response := map[string]interface{}{
+						"type":    "interrupted",
+						"id":      cmd["id"], 
+						"message": "task was interrupted",
+					}
+					json.NewEncoder(os.Stdout).Encode(response)
+					currentTaskID = ""
+					continue
+				}
+			}
+	
+			// Send success response only if not interrupted
+			if !interrupted {
+				response := map[string]interface{}{
+					"type":    "success",
+					"id":      cmd["id"],
+					"message": "ok",
+					"data":    cmd["data"],
+				}
+				json.NewEncoder(os.Stdout).Encode(response)
+			}
+			
+			currentTaskID = ""
+		}
+	}
+	`
+
+	workerFilePath := filepath.Join(tmpDir, "interrupt_worker.go")
+	err = os.WriteFile(workerFilePath, []byte(workerProgram), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Use the proper concurrent worker implementation
+	properWorkerProgram := `
+	package main
+	
+	import (
+		"bufio"
+		"context"
+		"encoding/json"
+		"os"
+		"sync"
+		"time"
+	)
+	
+	var (
+		currentTask     map[string]interface{}
+		currentCancel   context.CancelFunc
+		taskMutex       sync.Mutex
+	)
+	
+	func main() {
+		// Send a ready message to indicate the process is ready.
+		readyMsg := map[string]interface{}{"type": "ready"}
+		json.NewEncoder(os.Stdout).Encode(readyMsg)
+	
+		// Channel for messages from stdin
+		msgChan := make(chan map[string]interface{}, 10)
+		
+		// Start message reader goroutine - ALWAYS reading stdin
+		go func() {
+			scanner := bufio.NewScanner(os.Stdin)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if line == "" {
+					continue
+				}
+				
+				// DEBUG: Log every message received
+				json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+					"debug": "stdin received",
+					"message": line,
+				})
+		
+				var cmd map[string]interface{}
+				err := json.Unmarshal([]byte(line), &cmd)
+				if err != nil {
+					continue
+				}
+				
+				// DEBUG: Log message parsed and queued
+				json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+					"debug": "message queued",
+					"type": cmd["type"],
+					"id": cmd["id"],
+					"interrupt": cmd["interrupt"],
+				})
+				
+				msgChan <- cmd
+			}
+		}()
+	
+		// Main message processing loop
+		for cmd := range msgChan {
+			// DEBUG: Log message being processed
+			json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+				"debug": "processing message",
+				"type": cmd["type"],
+				"interrupt": cmd["interrupt"],
+			})
+			
+			// Check for interrupt command
+			if interrupt, ok := cmd["interrupt"]; ok && interrupt == "²INTERUPT²" {
+				json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+					"debug": "interrupt command processed - calling cancel",
+				})
+				
+				taskMutex.Lock()
+				if currentCancel != nil {
+					// Cancel the current task immediately
+					currentCancel()
+					json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+						"debug": "context cancelled",
+					})
+				} else {
+					json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+						"debug": "no task to cancel",
+					})
+				}
+				taskMutex.Unlock()
+				continue
+			}
+	
+			// Handle regular commands - run in separate goroutine so we can keep reading stdin
+			go func(cmd map[string]interface{}) {
+				json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+					"debug": "task goroutine started",
+					"id": cmd["id"],
+				})
+				
+				taskMutex.Lock()
+				ctx, cancel := context.WithCancel(context.Background())
+				currentTask = cmd
+				currentCancel = cancel
+				taskMutex.Unlock()
+				
+				json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+					"debug": "task context created, cancel function set",
+					"id": cmd["id"],
+				})
+				
+				// Check if this is a long-running command
+				if duration, ok := cmd["sleep"]; ok {
+					sleepTime := time.Duration(duration.(float64)) * time.Millisecond
+					
+					// Start processing and signal we've started
+					startMsg := map[string]interface{}{
+						"type": "started",
+						"id": cmd["id"],
+					}
+					json.NewEncoder(os.Stdout).Encode(startMsg)
+					
+					json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+						"debug": "entering sleep select",
+						"id": cmd["id"],
+						"duration": sleepTime.String(),
+					})
+					
+					// Sleep with cancellation support
+					select {
+					case <-ctx.Done():
+						// Task was interrupted
+						json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+							"debug": "task context cancelled during sleep",
+							"id": cmd["id"],
+						})
+						
+						response := map[string]interface{}{
+							"type":    "interrupted", 
+							"id":      cmd["id"],
+							"message": "task was interrupted",
+						}
+						json.NewEncoder(os.Stdout).Encode(response)
+						taskMutex.Lock()
+						currentTask = nil
+						currentCancel = nil
+						taskMutex.Unlock()
+						return
+					case <-time.After(sleepTime):
+						// Sleep completed normally
+						json.NewEncoder(os.Stderr).Encode(map[string]interface{}{
+							"debug": "sleep timer completed",
+							"id": cmd["id"],
+						})
+					}
+				} else {
+					// Regular quick command - simulate processing time with cancellation
+					select {
+					case <-ctx.Done():
+						// Task was interrupted
+						response := map[string]interface{}{
+							"type":    "interrupted",
+							"id":      cmd["id"], 
+							"message": "task was interrupted",
+						}
+						json.NewEncoder(os.Stdout).Encode(response)
+						taskMutex.Lock()
+						currentTask = nil
+						currentCancel = nil
+						taskMutex.Unlock()
+						return
+					case <-time.After(100 * time.Millisecond):
+						// Processing completed normally
+					}
+				}
+	
+				// Send success response only if not cancelled
+				select {
+				case <-ctx.Done():
+					// Was cancelled during final stage
+					response := map[string]interface{}{
+						"type":    "interrupted",
+						"id":      cmd["id"], 
+						"message": "task was interrupted",
+					}
+					json.NewEncoder(os.Stdout).Encode(response)
+				default:
+					// Send success response
+					response := map[string]interface{}{
+						"type":    "success",
+						"id":      cmd["id"],
+						"message": "ok",
+						"data":    cmd["data"],
+					}
+					json.NewEncoder(os.Stdout).Encode(response)
+				}
+				
+				taskMutex.Lock()
+				currentTask = nil
+				currentCancel = nil
+				taskMutex.Unlock()
+			}(cmd)
+		}
+	}
+	`
+	
+	workerFilePath = filepath.Join(tmpDir, "interrupt_worker_proper.go")
+	err = os.WriteFile(workerFilePath, []byte(properWorkerProgram), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Compile the test worker program.
+	workerBinaryPath := filepath.Join(tmpDir, "interrupt_worker")
+	cmd := exec.Command("go", "build", "-o", workerBinaryPath, workerFilePath)
+	cmd.Env = os.Environ()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Failed to compile worker program: %v\nOutput: %s", err, string(out))
+	}
+
+	// Create a logger.
+	logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
+
+	// Create the ProcessPool with 1 worker for predictable behavior
+	pool := NewProcessPool(
+		"interrupt-test",
+		1,
+		&logger,
+		tmpDir,
+		workerBinaryPath,
+		[]string{},
+		10*time.Second, // Worker timeout
+		30*time.Second, // Communication timeout  
+		5*time.Second,  // Initialization timeout
+	)
+	defer pool.StopAll()
+
+	// Test 1: Interrupt a long-running command
+	t.Run("InterruptExecutingCommand", func(t *testing.T) {
+		// Create a command that will run for 2 seconds
+		cmdID := "test-interrupt-cmd-123"
+		cmd := map[string]interface{}{
+			"id": cmdID,
+			"sleep": 2000.0, // 2 seconds
+			"data": "long running task",
+		}
+
+		// Start the command in a goroutine and measure timing
+		var response map[string]interface{}
+		var cmdErr error
+		done := make(chan bool, 1)
+		startTime := time.Now()
+
+		go func() {
+			response, cmdErr = pool.SendCommand(cmd)
+			done <- true
+		}()
+
+		// Wait for the command to start, then interrupt it
+		time.Sleep(200 * time.Millisecond)
+		
+		// Try to interrupt the command
+		err := pool.Interrupt(cmdID)
+		if err != nil {
+			t.Errorf("Interrupt failed: %v", err)
+		}
+
+		// Wait for command completion
+		select {
+		case <-done:
+			// Command completed - check timing and response
+		case <-time.After(5 * time.Second):
+			t.Fatal("Command did not complete within timeout")
+		}
+		
+		duration := time.Since(startTime)
+
+		// Verify command was interrupted (should complete in < 1 second, not the full 2 seconds)
+		if duration > 1*time.Second {
+			t.Errorf("Command took too long (%v), should have been interrupted quickly", duration)
+		}
+
+		// Verify we got an error or interrupted response
+		if cmdErr != nil {
+			t.Logf("Command returned error: %v", cmdErr)
+		}
+		
+		if response == nil {
+			t.Error("Expected a response from interrupted command")
+		} else {
+			responseType := response["type"]
+			if responseType != "interrupted" {
+				t.Errorf("Expected response type 'interrupted', got '%v'. Full response: %v", responseType, response)
+			} else {
+				t.Logf("✓ Command properly interrupted: %v", response)
+			}
+		}
+	})
+
+	// Test 2: Interrupt a queued command (when no worker available)
+	t.Run("InterruptQueuedCommand", func(t *testing.T) {
+		// First, start a long-running command to occupy the single worker
+		blockingCmd := map[string]interface{}{
+			"id": "blocking-cmd",
+			"sleep": 1000.0, // 1 second
+		}
+
+		go pool.SendCommand(blockingCmd)
+		time.Sleep(100 * time.Millisecond) // Let it start
+
+		// Now queue a second command that should be queued
+		queuedCmdID := "queued-cmd-456"  
+		queuedCmd := map[string]interface{}{
+			"id": queuedCmdID,
+			"data": "queued task",
+		}
+
+		var queuedErr error
+		queuedDone := make(chan bool, 1)
+
+		go func() {
+			_, queuedErr = pool.SendCommand(queuedCmd)
+			queuedDone <- true
+		}()
+
+		// Give it time to be queued, then interrupt it
+		time.Sleep(100 * time.Millisecond)
+		
+		err := pool.Interrupt(queuedCmdID)
+		if err != nil {
+			t.Errorf("Interrupt of queued command failed: %v", err)
+		}
+
+		// Wait for the queued command to complete
+		select {
+		case <-queuedDone:
+			if queuedErr == nil {
+				t.Error("Expected queued command to return error after interrupt")
+			} else if queuedErr.Error() != "command queued-cmd-456 was interrupted while queued" {
+				t.Errorf("Expected specific interrupt error, got: %v", queuedErr)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("Queued command did not complete within timeout")
+		}
+	})
+}

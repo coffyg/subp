@@ -88,7 +88,8 @@ run_test_group "Concurrent Operations" \
 
 # Process behavior
 run_test_group "Process Behavior" \
-    "TestSlowCommands"
+    "TestSlowCommands" \
+    "TestSequentialStartup"
 
 # Queue behavior
 run_test_group "Queue Behavior" \
@@ -97,6 +98,10 @@ run_test_group "Queue Behavior" \
     "TestQueuePriorityOrder" \
     "TestQueueTimeout" \
     "TestPriorityQueueBehavior"
+
+# Interrupt functionality
+run_test_group "Interrupt Functionality" \
+    "TestInterrupt"
 
 # Error handling
 run_test_group "Error Handling" \
