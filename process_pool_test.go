@@ -684,7 +684,128 @@ func TestInterrupt(t *testing.T) {
 		}
 	})
 
-	// Test 2: Interrupt a queued command (when no worker available)
+	// Test 2: Multiple workers, concurrent tasks, interrupt by specific ID
+	t.Run("InterruptConcurrentTasks", func(t *testing.T) {
+		// Create a logger for this test
+		logger := zerolog.New(os.Stdout).With().Timestamp().Logger()
+		
+		// Create a pool with 4 workers to handle multiple concurrent tasks
+		multiPool := NewProcessPool(
+			"multi-worker-test",
+			4, // 4 workers
+			&logger,
+			tmpDir,
+			workerBinaryPath,
+			[]string{},
+			30*time.Second, // Worker timeout
+			30*time.Second, // Communication timeout  
+			10*time.Second, // Initialization timeout
+		)
+		defer multiPool.StopAll()
+
+		// Start 4 concurrent tasks (one per worker)
+		taskIDs := []string{
+			"task-1-long-running",
+			"task-2-long-running", 
+			"task-3-long-running",
+			"task-4-long-running",
+		}
+		
+		// Track results for each task
+		results := make(map[string]chan struct{
+			resp map[string]interface{}
+			err  error
+		})
+		
+		// Start all tasks concurrently
+		for i, taskID := range taskIDs {
+			results[taskID] = make(chan struct{
+				resp map[string]interface{}
+				err  error
+			}, 1)
+			
+			go func(id string, index int) {
+				cmd := map[string]interface{}{
+					"id":    id,
+					"sleep": 5000.0, // 5 seconds - long enough to interrupt
+					"data":  fmt.Sprintf("concurrent task %d", index+1),
+				}
+				
+				resp, err := multiPool.SendCommand(cmd)
+				results[id] <- struct{
+					resp map[string]interface{}
+					err  error
+				}{resp, err}
+			}(taskID, i)
+		}
+		
+		// Let all tasks start running
+		time.Sleep(500 * time.Millisecond)
+		
+		// Now test interrupting specific tasks by ID
+		interruptTests := []struct{
+			taskID string
+			shouldSucceed bool
+		}{
+			{"task-2-long-running", true},  // Should interrupt successfully
+			{"task-4-long-running", true},  // Should interrupt successfully  
+			{"nonexistent-task-id", false}, // Should fail - no such task
+			{"task-1-long-running", true},  // Should interrupt successfully
+		}
+		
+		for _, test := range interruptTests {
+			err := multiPool.Interrupt(test.taskID)
+			
+			if test.shouldSucceed {
+				if err != nil {
+					t.Errorf("❌ Failed to interrupt task %s: %v", test.taskID, err)
+				} else {
+					t.Logf("✅ Successfully interrupted task: %s", test.taskID)
+				}
+			} else {
+				if err == nil {
+					t.Errorf("❌ Expected interrupt to fail for %s, but it succeeded", test.taskID)
+				} else if err.Error() == fmt.Sprintf("no command found with ID: %s", test.taskID) {
+					t.Logf("✅ Correctly failed to interrupt non-existent task: %s", test.taskID)
+				} else {
+					t.Errorf("❌ Wrong error for non-existent task %s: %v", test.taskID, err)
+				}
+			}
+		}
+		
+		// Wait for all tasks to complete (or be interrupted) and check results
+		interruptedCount := 0
+		completedCount := 0
+		errorCount := 0
+		
+		for taskID, resultChan := range results {
+			select {
+			case result := <-resultChan:
+				if result.err != nil {
+					t.Logf("Task %s returned error: %v", taskID, result.err)
+					errorCount++
+				} else if result.resp["type"] == "interrupted" {
+					t.Logf("Task %s was interrupted: %v", taskID, result.resp)
+					interruptedCount++
+				} else {
+					t.Logf("Task %s completed normally: %v", taskID, result.resp)
+					completedCount++
+				}
+			case <-time.After(10 * time.Second):
+				t.Errorf("❌ Task %s timed out", taskID)
+			}
+		}
+		
+		t.Logf("📊 Results: %d interrupted, %d completed, %d errors", 
+			interruptedCount, completedCount, errorCount)
+			
+		// We should have interrupted at least 2 tasks (task-1, task-2, task-4)
+		if interruptedCount < 2 {
+			t.Errorf("❌ Expected at least 2 interrupted tasks, got %d", interruptedCount)
+		}
+	})
+
+	// Test 3: Interrupt a queued command (when no worker available)
 	t.Run("InterruptQueuedCommand", func(t *testing.T) {
 		// First, start a long-running command to occupy the single worker
 		blockingCmd := map[string]interface{}{
