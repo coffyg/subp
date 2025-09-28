@@ -118,12 +118,29 @@ NewProcessPool(
   - How long to wait for worker (should be infinite with queue)
   - How long task can run (separate concern)
 
+## Update: Queue Timeout with Auto-Recovery
+
+### Additional Fix Implemented
+- **Queue timeout detection**: If commands wait > workerTimeout in queue, workers are assumed stuck
+- **Automatic restart**: All workers restart when queue timeout detected
+- **Command preservation**: Queued commands are preserved and re-processed after restart
+- **Self-healing**: System automatically recovers from hung/crashed workers
+
+### How It Works
+1. Command waits in queue for available worker
+2. If wait exceeds workerTimeout (45s for SDXL), assumes workers are stuck
+3. Restarts all workers
+4. Re-queues the waiting command
+5. Continues processing normally
+
+This provides automatic recovery from subprocess hangs/crashes without losing commands.
+
 ## Conclusion
 
-The "timeout exceeded, no available workers" error is now fixed. Subp has a real queue that handles:
-- Long-running tasks (SDXL inference)
-- Burst traffic patterns
-- Proper command cancellation
-- Clean shutdown
+The "timeout exceeded, no available workers" error is now completely fixed with:
+1. **Real command queue** - no more timeouts from busy workers
+2. **Auto-recovery** - stuck workers automatically restart
+3. **Command preservation** - no lost commands during recovery
+4. **Full compatibility** - all existing tests pass
 
-This should completely eliminate the timeout errors in production while maintaining full backward compatibility.
+The system is now robust against both high load and worker failures.
