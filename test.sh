@@ -97,7 +97,8 @@ run_test_group "Queue Behavior" \
     "TestQueueUnderLoad" \
     "TestQueuePriorityOrder" \
     "TestQueueTimeout" \
-    "TestPriorityQueueBehavior"
+    "TestPriorityQueueBehavior" \
+    "TestQueueTimeoutTriggersRestart"
 
 # Interrupt functionality
 run_test_group "Interrupt Functionality" \

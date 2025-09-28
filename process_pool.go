@@ -727,8 +727,11 @@ func (pool *ProcessPool) dispatcher() {
 				continue
 			}
 			
-			// Wait for an available worker (no timeout for dispatcher)
+			// Wait for an available worker with timeout
 			var worker *Process
+			workerTimer := time.NewTimer(pool.workerTimeout)
+			defer workerTimer.Stop()
+			
 			select {
 			case <-pool.stop:
 				// Pool is stopping
@@ -743,6 +746,30 @@ func (pool *ProcessPool) dispatcher() {
 			case worker = <-pool.availableWorkers:
 				// Got a worker
 				worker.SetBusy(1)
+			case <-workerTimer.C:
+				// Timeout waiting for worker - workers are likely stuck
+				pool.logger.Error().Msgf("Queue timeout after %v waiting for worker - restarting all workers", pool.workerTimeout)
+				
+				// Restart all workers
+				pool.restartAllWorkers()
+				
+				// Put command back in queue (at front)
+				go func(cmd *queuedCommand) {
+					select {
+					case pool.commandQueue <- cmd:
+						// Re-queued successfully
+					case <-pool.stop:
+						// Pool stopping, abandon
+						cmd.response <- commandResponse{err: fmt.Errorf("pool stopping during restart")}
+						close(cmd.response)
+					}
+				}(qCmd)
+				
+				// Clean up tracking for now (will be re-added when re-queued)
+				pool.mutex.Lock()
+				delete(pool.commandToProcess, cmdID)
+				pool.mutex.Unlock()
+				continue
 			}
 			
 			// Check again if cancelled after getting worker
@@ -786,6 +813,28 @@ func (pool *ProcessPool) dispatcher() {
 				close(respChan)
 			}(worker, qCmd.cmd, qCmd.response)
 		}
+	}
+}
+
+// restartAllWorkers restarts all workers in the pool
+func (pool *ProcessPool) restartAllWorkers() {
+	pool.logger.Warn().Msg("Restarting all workers due to queue timeout")
+	
+	// Restart each worker
+	pool.mutex.RLock()
+	workers := make([]*Process, len(pool.processes))
+	copy(workers, pool.processes)
+	pool.mutex.RUnlock()
+	
+	for _, process := range workers {
+		if process != nil {
+			process.Restart()
+		}
+	}
+	
+	// Wait for at least one worker to be ready
+	if err := pool.WaitForReady(); err != nil {
+		pool.logger.Error().Err(err).Msg("Failed to wait for workers after restart")
 	}
 }
 
