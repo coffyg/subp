@@ -388,6 +388,18 @@ func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
 	}
 }
 
+// queuedCommand represents a command waiting in the queue
+type queuedCommand struct {
+	cmd      map[string]interface{}
+	response chan commandResponse
+}
+
+// commandResponse holds the response or error from a command
+type commandResponse struct {
+	result map[string]interface{}
+	err    error
+}
+
 // ProcessPool is a pool of processes.
 type ProcessPool struct {
 	processes        []*Process
@@ -401,6 +413,8 @@ type ProcessPool struct {
 	availableWorkers chan *Process // Channel for available workers
 	commandToProcess map[string]*Process // Track which process is handling which command ID
 	cancelledCommands map[string]bool // Track cancelled command IDs
+	commandQueue     chan *queuedCommand // Real queue for commands
+	queueDepth       int // Maximum queue depth
 }
 
 // NewProcessPool creates a new process pool.
@@ -416,6 +430,7 @@ func NewProcessPool(
 	initTimeout time.Duration,
 ) *ProcessPool {
 	shouldStop := int32(0)
+	queueDepth := 1000 // Reasonable default queue depth
 	pool := &ProcessPool{
 		processes:        make([]*Process, size),
 		logger:           logger,
@@ -428,6 +443,8 @@ func NewProcessPool(
 		availableWorkers: make(chan *Process, size), // Buffer size = number of workers
 		commandToProcess: make(map[string]*Process),
 		cancelledCommands: make(map[string]bool),
+		commandQueue:     make(chan *queuedCommand, queueDepth),
+		queueDepth:       queueDepth,
 	}
 	// Create all processes first (without starting them)
 	for i := 0; i < size; i++ {
@@ -442,6 +459,9 @@ func NewProcessPool(
 			// Continue with other processes even if one fails
 		}
 	}
+	
+	// Start the dispatcher goroutine
+	go pool.dispatcher()
 	
 	return pool
 }
@@ -586,6 +606,11 @@ func (pool *ProcessPool) WaitForReady() error {
 
 // SendCommand sends a command to a worker in the process pool.
 func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]interface{}, error) {
+	// Check if pool is stopping
+	if atomic.LoadInt32(&pool.shouldStop) == 1 {
+		return nil, fmt.Errorf("pool is stopping")
+	}
+	
 	// Extract or assign command ID first
 	var cmdID string
 	if id, ok := cmd["id"]; ok {
@@ -595,47 +620,36 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 		cmd["id"] = cmdID
 	}
 	
-	// Track command as queued before getting worker
+	// Track command as queued
 	pool.mutex.Lock()
 	pool.commandToProcess[cmdID] = nil // nil means queued, waiting for worker
 	pool.mutex.Unlock()
 	
-	// Try to get worker
-	worker, err := pool.GetWorker()
-	if err != nil {
-		// Clean up if couldn't get worker
+	// Create response channel for this command
+	respChan := make(chan commandResponse, 1)
+	
+	// Create queued command
+	qCmd := &queuedCommand{
+		cmd:      cmd,
+		response: respChan,
+	}
+	
+	// Try to add to queue
+	select {
+	case pool.commandQueue <- qCmd:
+		// Successfully queued
+	default:
+		// Queue is full
 		pool.mutex.Lock()
 		delete(pool.commandToProcess, cmdID)
 		pool.mutex.Unlock()
-		return nil, err
+		return nil, fmt.Errorf("command queue is full (depth: %d)", pool.queueDepth)
 	}
 	
-	// Check if command was cancelled while waiting for worker
-	pool.mutex.Lock()
-	if pool.cancelledCommands[cmdID] {
-		// Command was cancelled, clean up and return error
-		delete(pool.commandToProcess, cmdID)
-		delete(pool.cancelledCommands, cmdID)
-		pool.mutex.Unlock()
-		// Release worker back to pool
-		worker.SetBusy(0)
-		return nil, fmt.Errorf("command %s was interrupted while queued", cmdID)
-	}
+	// Wait for response from dispatcher
+	resp := <-respChan
 	
-	// Update tracking to show which worker is handling this command
-	pool.commandToProcess[cmdID] = worker
-	pool.mutex.Unlock()
-	
-	// Execute command - worker.SendCommand will handle the rest of tracking
-	response, execErr := worker.SendCommand(cmd)
-	
-	// Clean up tracking on completion (worker.SendCommand also cleans up, but this ensures it)
-	pool.mutex.Lock()
-	delete(pool.commandToProcess, cmdID)
-	delete(pool.cancelledCommands, cmdID) // Clean up any cancelled flag
-	pool.mutex.Unlock()
-	
-	return response, execErr
+	return resp.result, resp.err
 }
 
 // Interrupt sends an interrupt signal to the process handling the specified command ID.
@@ -679,9 +693,117 @@ func (pool *ProcessPool) Interrupt(id string) error {
 	return nil
 }
 
+// dispatcher pulls commands from the queue and assigns them to available workers
+func (pool *ProcessPool) dispatcher() {
+	for {
+		select {
+		case <-pool.stop:
+			// Pool is stopping, exit dispatcher
+			return
+		case qCmd := <-pool.commandQueue:
+			// Get command ID for tracking
+			cmdID, ok := qCmd.cmd["id"].(string)
+			if !ok {
+				cmdID = uuid.New().String()
+				qCmd.cmd["id"] = cmdID
+			}
+			
+			// Check if command was cancelled while in queue
+			pool.mutex.RLock()
+			cancelled := pool.cancelledCommands[cmdID]
+			pool.mutex.RUnlock()
+			
+			if cancelled {
+				// Command was cancelled, send error response
+				pool.mutex.Lock()
+				delete(pool.cancelledCommands, cmdID)
+				delete(pool.commandToProcess, cmdID)
+				pool.mutex.Unlock()
+				
+				qCmd.response <- commandResponse{
+					err: fmt.Errorf("command %s was interrupted while queued", cmdID),
+				}
+				close(qCmd.response)
+				continue
+			}
+			
+			// Wait for an available worker (no timeout for dispatcher)
+			var worker *Process
+			select {
+			case <-pool.stop:
+				// Pool is stopping
+				qCmd.response <- commandResponse{err: fmt.Errorf("pool is stopping")}
+				close(qCmd.response)
+				
+				// Clean up tracking
+				pool.mutex.Lock()
+				delete(pool.commandToProcess, cmdID)
+				pool.mutex.Unlock()
+				continue
+			case worker = <-pool.availableWorkers:
+				// Got a worker
+				worker.SetBusy(1)
+			}
+			
+			// Check again if cancelled after getting worker
+			pool.mutex.RLock()
+			cancelled = pool.cancelledCommands[cmdID]
+			pool.mutex.RUnlock()
+			
+			if cancelled {
+				// Release worker and send error
+				worker.SetBusy(0)
+				
+				pool.mutex.Lock()
+				delete(pool.cancelledCommands, cmdID)
+				delete(pool.commandToProcess, cmdID)
+				pool.mutex.Unlock()
+				
+				qCmd.response <- commandResponse{
+					err: fmt.Errorf("command %s was interrupted while queued", cmdID),
+				}
+				close(qCmd.response)
+				continue
+			}
+			
+			// Update tracking to show which worker is handling this command
+			pool.mutex.Lock()
+			pool.commandToProcess[cmdID] = worker
+			pool.mutex.Unlock()
+			
+			// Execute command on worker (in goroutine to not block dispatcher)
+			go func(w *Process, cmd map[string]interface{}, respChan chan commandResponse) {
+				result, err := w.SendCommand(cmd)
+				
+				// Clean up tracking
+				pool.mutex.Lock()
+				delete(pool.commandToProcess, cmdID)
+				delete(pool.cancelledCommands, cmdID)
+				pool.mutex.Unlock()
+				
+				// Send response
+				respChan <- commandResponse{result: result, err: err}
+				close(respChan)
+			}(worker, qCmd.cmd, qCmd.response)
+		}
+	}
+}
+
 // StopAll stops all the processes in the process pool.
 func (pool *ProcessPool) StopAll() {
 	pool.SetStop()
+	
+	// Close command queue first to prevent new commands
+	close(pool.commandQueue)
+	
+	// Drain any remaining queued commands with error responses
+	for qCmd := range pool.commandQueue {
+		qCmd.response <- commandResponse{
+			err: fmt.Errorf("pool is shutting down"),
+		}
+		close(qCmd.response)
+	}
+	
 	for _, process := range pool.processes {
 		process.Stop()
 	}
