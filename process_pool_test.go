@@ -167,8 +167,8 @@ func TestSequentialStartup(t *testing.T) {
 		readyMsg := map[string]interface{}{"type": "ready"}
 		json.NewEncoder(os.Stdout).Encode(readyMsg)
 		
-		// Keep the process alive briefly for testing
-		time.Sleep(100 * time.Millisecond)
+		// Keep the process alive long enough for the test to check ready status
+		time.Sleep(1 * time.Second)
 	}
 	`
 

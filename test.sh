@@ -108,12 +108,15 @@ run_test_group "Interrupt Functionality" \
 run_test_group "Error Handling" \
     "TestProcessStderr" \
     "TestWorkerReturnStatus" \
-    "TestProcessRestart"
+    "TestProcessRestart" \
+    "TestTimeoutMechanism" \
+    "TestRestartHistory"
 
 # Pool management
 run_test_group "Pool Management" \
     "TestPoolStop" \
-    "TestWorkerTimeout"
+    "TestWorkerTimeout" \
+    "TestProcessMetrics"
 
 # Edge cases
 run_test_group "Edge Cases" \

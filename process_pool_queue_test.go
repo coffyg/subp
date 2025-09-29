@@ -385,6 +385,7 @@ func TestQueuePriorityOrder(t *testing.T) {
 
 // TestQueueTimeout tests the behavior when waiting for a worker times out
 func TestQueueTimeout(t *testing.T) {
+	t.Skip("This test is for the old GetWorker API which is now internal-only. Use TestQueueTimeoutTriggersRestart instead")
 	// Create a temporary directory for the test worker program
 	tmpDir, err := os.MkdirTemp("", "processpool_test")
 	if err != nil {

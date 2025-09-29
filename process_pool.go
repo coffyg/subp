@@ -46,16 +46,39 @@ type Process struct {
 	stdinPipe       io.WriteCloser
 	stdoutPipe      io.ReadCloser
 	stderrPipe      io.ReadCloser
-	activeCommandID string // Currently executing command ID
+	activeCommandID string         // Currently executing command ID
+	restartHistory  []RestartEvent // Rolling history of last 10 restart events
+	
+	// Response routing for persistent reader
+	responseChannels map[string]chan map[string]interface{} // Command ID -> response channel
+	responseMutex    sync.RWMutex                           // Mutex for response channel map
+	readerDone       chan struct{}                          // Signal reader to stop
+	
+	// Performance tracking
+	successCount    int       // Total successful commands
+	failureCount    int       // Total failed commands
+	lastActiveTime  time.Time // Last time a command completed successfully
+	lastErrorTime   time.Time // Last time a command failed
+}
+
+// RestartEvent tracks details of a restart event
+type RestartEvent struct {
+	Time      time.Time `json:"time"`
+	EventType string    `json:"event_type"` // timeout, send_error, read_error, queue_timeout, manual
+	TriggerID string    `json:"trigger_id"` // Command ID that triggered restart
 }
 
 // ProcessExport exports process information.
 type ProcessExport struct {
-	IsReady         bool   `json:"IsReady"`
-	Latency         int64  `json:"Latency"`
-	Name            string `json:"Name"`
-	Restarts        int    `json:"Restarts"`
-	RequestsHandled int    `json:"RequestsHandled"`
+	IsReady         bool           `json:"IsReady"`
+	Latency         int64          `json:"Latency"`
+	Name            string         `json:"Name"`
+	Restarts        int            `json:"Restarts"`
+	RequestsHandled int            `json:"RequestsHandled"`
+	RestartHistory  []RestartEvent `json:"RestartHistory,omitempty"`
+	SuccessRate     float64        `json:"SuccessRate"`     // Percentage of successful commands (0.0-1.0)
+	LastActiveTime  *time.Time     `json:"LastActiveTime"`  // Last successful command completion
+	LastErrorTime   *time.Time     `json:"LastErrorTime"`   // Last command failure
 }
 
 // Start starts the process by creating a new exec.Cmd, setting up the stdin and stdout pipes, and starting the process.
@@ -111,6 +134,12 @@ func (p *Process) Start() {
 		return
 	}
 
+	// Initialize response routing
+	p.responseMutex.Lock()
+	p.responseChannels = make(map[string]chan map[string]interface{})
+	p.readerDone = make(chan struct{})
+	p.responseMutex.Unlock()
+	
 	// Only start goroutines after process successfully starts
 	p.wg.Add(2)
 	go func() {
@@ -119,13 +148,24 @@ func (p *Process) Start() {
 	}()
 	go func() {
 		defer p.wg.Done()
+		// First wait for ready, then start persistent reader
 		p.WaitForReadyScan()
+		// Now start the persistent reader after ready is received
+		p.persistentReader()
 	}()
 }
 
 // Stop stops the process by sending a kill signal to the process and cleaning up the resources.
 func (p *Process) Stop() {
 	p.SetReady(0)
+	
+	// Signal reader to stop
+	p.responseMutex.Lock()
+	if p.readerDone != nil {
+		close(p.readerDone)
+	}
+	p.responseMutex.Unlock()
+	
 	if p.cmd != nil && p.cmd.Process != nil {
 		p.cmd.Process.Kill()
 	}
@@ -154,6 +194,34 @@ func (p *Process) cleanupChannelsAndResources() {
 	p.stderr = nil
 	p.cmd = nil
 	p.mutex.Unlock()
+	
+	// Clean up response channels
+	p.responseMutex.Lock()
+	for _, ch := range p.responseChannels {
+		close(ch)
+	}
+	p.responseChannels = nil
+	p.responseMutex.Unlock()
+}
+
+// addRestartEvent adds a restart event to the rolling history (max 10)
+func (p *Process) addRestartEvent(eventType string, triggerID string) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	event := RestartEvent{
+		Time:      time.Now(),
+		EventType: eventType,
+		TriggerID: triggerID,
+	}
+
+	// Add to history
+	p.restartHistory = append(p.restartHistory, event)
+
+	// Keep only last 10 events
+	if len(p.restartHistory) > 10 {
+		p.restartHistory = p.restartHistory[len(p.restartHistory)-10:]
+	}
 }
 
 // Restart stops the process and starts it again.
@@ -233,17 +301,16 @@ func (p *Process) readStderr() {
 }
 
 // WaitForReadyScan waits for the process to send a "ready" message.
+// This runs during startup, then exits so persistentReader can take over
 func (p *Process) WaitForReadyScan() {
 	for {
 		line, err := p.stdout.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
-				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
+				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout during ready scan", p.name)
 			}
 			// Signal that the process needs restart by marking it as not ready
 			p.SetReady(0)
-			// Simply return and let the process be restarted when needed
-			// The process will be restarted by SendCommand when it fails
 			return
 		}
 		if line == "" || line == "\n" {
@@ -252,7 +319,7 @@ func (p *Process) WaitForReadyScan() {
 
 		var response map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &response); err != nil {
-			p.logger.Warn().Msgf("[nyxsub|%s] Non JSON message received: '%s'", p.name, line)
+			p.logger.Warn().Msgf("[nyxsub|%s] Non JSON message received during ready scan: '%s'", p.name, line)
 			continue
 		}
 
@@ -277,17 +344,37 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	}
 
 	start := time.Now().UnixMilli()
+	cmdID := cmd["id"].(string)
 
-	// Lock for command operations to prevent concurrent access to stdin/stdout
+	// Create response channel for this command
+	respChan := make(chan map[string]interface{}, 1)
+	p.responseMutex.Lock()
+	p.responseChannels[cmdID] = respChan
+	p.responseMutex.Unlock()
+	
+	// Clean up response channel on exit
+	defer func() {
+		p.responseMutex.Lock()
+		delete(p.responseChannels, cmdID)
+		p.responseMutex.Unlock()
+	}()
+
+	// Lock for command operations to prevent concurrent access to stdin
 	p.commandMutex.Lock()
 
 	// Track active command
-	cmdID := cmd["id"].(string)
 	p.activeCommandID = cmdID
 
 	// Send command
 	if err := p.stdin.Encode(cmd); err != nil {
 		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to send command", p.name)
+		// Track failure
+		p.mutex.Lock()
+		p.failureCount++
+		p.lastErrorTime = time.Now()
+		p.mutex.Unlock()
+		// Track restart event
+		p.addRestartEvent("send_error", cmdID)
 		// Clean up local command tracking
 		p.activeCommandID = ""
 		// Mark as not ready before unlocking to prevent new commands
@@ -300,29 +387,57 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	// Log the command sent
 	jsonCmd, _ := json.Marshal(cmd)
 	p.logger.Debug().Msgf("[nyxsub|%s] Command sent: %v", p.name, string(jsonCmd))
-
-	// Wait for response
-	response, err := p.readResponse(cmd["id"].(string))
-	if err != nil {
-		// Clean up local command tracking
-		p.activeCommandID = ""
-		// Mark as not ready before unlocking to prevent new commands
-		p.SetReady(0)
-		p.commandMutex.Unlock()
-		p.Restart()
-		return nil, err
-	}
 	
-	// Clean up local command tracking on successful completion
-	p.activeCommandID = ""
+	// Unlock immediately after sending - we don't need to hold the lock while waiting
 	p.commandMutex.Unlock()
 
-	p.mutex.Lock()
-	p.latency = time.Now().UnixMilli() - start
-	p.requestsHandled++
-	p.mutex.Unlock()
-
-	return response, nil
+	// Wait for response with timeout
+	timer := time.NewTimer(p.timeout)
+	defer timer.Stop()
+	
+	select {
+	case response := <-respChan:
+		// Got response
+		p.activeCommandID = ""
+		
+		p.mutex.Lock()
+		p.latency = time.Now().UnixMilli() - start
+		p.requestsHandled++
+		p.successCount++
+		p.lastActiveTime = time.Now()
+		p.mutex.Unlock()
+		
+		return response, nil
+	case <-timer.C:
+		// Timeout
+		p.logger.Error().Msgf("[nyxsub|%s] Communication timed out for command %s", p.name, cmdID)
+		// Track failure
+		p.mutex.Lock()
+		p.failureCount++
+		p.lastErrorTime = time.Now()
+		p.mutex.Unlock()
+		// Track restart event
+		p.addRestartEvent("timeout", cmdID)
+		// Clean up local command tracking
+		p.activeCommandID = ""
+		// Mark as not ready to prevent new commands
+		p.SetReady(0)
+		p.Restart()
+		return nil, errors.New("communication timed out")
+	case <-p.readerDone:
+		// Reader died, process needs restart
+		p.logger.Error().Msgf("[nyxsub|%s] Reader died while waiting for command %s", p.name, cmdID)
+		// Track failure
+		p.mutex.Lock()
+		p.failureCount++
+		p.lastErrorTime = time.Now()
+		p.mutex.Unlock()
+		p.addRestartEvent("reader_died", cmdID)
+		p.activeCommandID = ""
+		p.SetReady(0)
+		p.Restart()
+		return nil, errors.New("reader died")
+	}
 }
 
 // WaitForReady waits until this specific process is ready or times out.
@@ -339,50 +454,74 @@ func (p *Process) WaitForReady() error {
 	}
 }
 
-// readResponse reads the response for a specific command ID.
-func (p *Process) readResponse(cmdID string) (map[string]interface{}, error) {
-	timer := time.NewTimer(p.timeout)
-	defer timer.Stop()
-
+// persistentReader continuously reads from stdout and routes responses to waiting commands
+func (p *Process) persistentReader() {
 	for {
+		// Check if we should stop
 		select {
-		case <-timer.C:
-			p.logger.Error().Msgf("[nyxsub|%s] Communication timed out", p.name)
-			return nil, errors.New("communication timed out")
+		case <-p.readerDone:
+			return
 		default:
-			line, err := p.stdout.ReadString('\n')
-			if err != nil {
-				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout", p.name)
-				return nil, err
+		}
+		
+		// Read next line (this blocks)
+		line, err := p.stdout.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout in persistent reader", p.name)
+			} else {
+				p.logger.Error().Msgf("[nyxsub|%s] Process died (EOF on stdout)", p.name)
 			}
-			if line == "" || line == "\n" {
-				continue
-			}
-
-			var response map[string]interface{}
-			if err := json.Unmarshal([]byte(line), &response); err != nil {
-				p.logger.Warn().Msgf("[nyxsub|%s] Non JSON message received: '%s'", p.name, line)
-				continue
-			}
-
-			// Check for matching response ID
-			if response["id"] == cmdID {
-				// Only return for final response types, not intermediate ones like "started"
+			// Reader failed (including EOF which means process died), mark as not ready
+			p.SetReady(0)
+			return
+		}
+		
+		if line == "" || line == "\n" {
+			continue
+		}
+		
+		// Parse JSON response
+		var response map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &response); err != nil {
+			p.logger.Warn().Msgf("[nyxsub|%s] Non JSON message received: '%s'", p.name, line)
+			continue
+		}
+		
+		// Route response to waiting command
+		if cmdID, hasID := response["id"].(string); hasID {
+			p.responseMutex.RLock()
+			respChan, exists := p.responseChannels[cmdID]
+			p.responseMutex.RUnlock()
+			
+			if exists {
+				// Check response type to determine if it's final or intermediate
 				responseType, hasType := response["type"]
 				if !hasType {
 					// No type field - assume it's a final response
-					return response, nil
+					select {
+					case respChan <- response:
+					default:
+						p.logger.Warn().Msgf("[nyxsub|%s] Response channel full for command %s", p.name, cmdID)
+					}
+				} else {
+					// Check if this is a final response type
+					switch responseType {
+					case "started", "progress", "info":
+						// Intermediate response - log but don't send to channel
+						p.logger.Debug().Msgf("[nyxsub|%s] Intermediate response for %s: %v", p.name, cmdID, responseType)
+					default:
+						// Final response (success, error, interrupted, etc.)
+						select {
+						case respChan <- response:
+						default:
+							p.logger.Warn().Msgf("[nyxsub|%s] Response channel full for command %s", p.name, cmdID)
+						}
+					}
 				}
-				
-				// Skip intermediate responses like "started", only return for final ones
-				switch responseType {
-				case "started", "progress", "info":
-					// Intermediate response - continue waiting for final response
-					continue
-				default:
-					// Final response (success, error, interrupted, etc.) - return it
-					return response, nil
-				}
+			} else {
+				// No one waiting for this response (might be late response from interrupted command)
+				p.logger.Debug().Msgf("[nyxsub|%s] Received response for unknown command %s", p.name, cmdID)
 			}
 		}
 	}
@@ -402,19 +541,19 @@ type commandResponse struct {
 
 // ProcessPool is a pool of processes.
 type ProcessPool struct {
-	processes        []*Process
-	mutex            sync.RWMutex
-	logger           *zerolog.Logger
-	shouldStop       int32
-	stop             chan bool
-	workerTimeout    time.Duration
-	comTimeout       time.Duration
-	initTimeout      time.Duration
-	availableWorkers chan *Process // Channel for available workers
-	commandToProcess map[string]*Process // Track which process is handling which command ID
-	cancelledCommands map[string]bool // Track cancelled command IDs
-	commandQueue     chan *queuedCommand // Real queue for commands
-	queueDepth       int // Maximum queue depth
+	processes         []*Process
+	mutex             sync.RWMutex
+	logger            *zerolog.Logger
+	shouldStop        int32
+	stop              chan bool
+	workerTimeout     time.Duration
+	comTimeout        time.Duration
+	initTimeout       time.Duration
+	availableWorkers  chan *Process       // Channel for available workers
+	commandToProcess  map[string]*Process // Track which process is handling which command ID
+	cancelledCommands map[string]bool     // Track cancelled command IDs
+	commandQueue      chan *queuedCommand // Real queue for commands
+	queueDepth        int                 // Maximum queue depth
 }
 
 // NewProcessPool creates a new process pool.
@@ -432,25 +571,25 @@ func NewProcessPool(
 	shouldStop := int32(0)
 	queueDepth := 1000 // Reasonable default queue depth
 	pool := &ProcessPool{
-		processes:        make([]*Process, size),
-		logger:           logger,
-		mutex:            sync.RWMutex{},
-		shouldStop:       shouldStop,
-		stop:             make(chan bool, 1),
-		workerTimeout:    workerTimeout,
-		comTimeout:       comTimeout,
-		initTimeout:      initTimeout,
-		availableWorkers: make(chan *Process, size), // Buffer size = number of workers
-		commandToProcess: make(map[string]*Process),
+		processes:         make([]*Process, size),
+		logger:            logger,
+		mutex:             sync.RWMutex{},
+		shouldStop:        shouldStop,
+		stop:              make(chan bool, 1),
+		workerTimeout:     workerTimeout,
+		comTimeout:        comTimeout,
+		initTimeout:       initTimeout,
+		availableWorkers:  make(chan *Process, size), // Buffer size = number of workers
+		commandToProcess:  make(map[string]*Process),
 		cancelledCommands: make(map[string]bool),
-		commandQueue:     make(chan *queuedCommand, queueDepth),
-		queueDepth:       queueDepth,
+		commandQueue:      make(chan *queuedCommand, queueDepth),
+		queueDepth:        queueDepth,
 	}
 	// Create all processes first (without starting them)
 	for i := 0; i < size; i++ {
 		pool.newProcess(name, i, cmd, cmdArgs, logger, cwd)
 	}
-	
+
 	// Start processes sequentially and wait for each to be ready
 	for i := 0; i < size; i++ {
 		pool.processes[i].Start()
@@ -459,10 +598,10 @@ func NewProcessPool(
 			// Continue with other processes even if one fails
 		}
 	}
-	
+
 	// Start the dispatcher goroutine
 	go pool.dispatcher()
-	
+
 	return pool
 }
 
@@ -496,6 +635,7 @@ func (pool *ProcessPool) newProcess(name string, i int, cmd string, cmdArgs []st
 		id:              i,
 		cwd:             cwd,
 		pool:            pool,
+		restartHistory:  make([]RestartEvent, 0, 10), // Initialize with capacity 10
 	}
 	pool.mutex.Unlock()
 	// Start() will be called manually in NewProcessPool for sequential startup
@@ -508,12 +648,37 @@ func (pool *ProcessPool) ExportAll() []ProcessExport {
 	for _, process := range pool.processes {
 		if process != nil {
 			process.mutex.Lock()
+			// Copy restart history to avoid race conditions
+			historyCopy := make([]RestartEvent, len(process.restartHistory))
+			copy(historyCopy, process.restartHistory)
+			
+			// Calculate success rate
+			var successRate float64
+			totalCommands := process.successCount + process.failureCount
+			if totalCommands > 0 {
+				successRate = float64(process.successCount) / float64(totalCommands)
+			}
+			
+			// Prepare time pointers
+			var lastActivePtr *time.Time
+			var lastErrorPtr *time.Time
+			if !process.lastActiveTime.IsZero() {
+				lastActivePtr = &process.lastActiveTime
+			}
+			if !process.lastErrorTime.IsZero() {
+				lastErrorPtr = &process.lastErrorTime
+			}
+			
 			exports = append(exports, ProcessExport{
 				IsReady:         atomic.LoadInt32(&process.isReady) == 1,
 				Latency:         process.latency,
 				Name:            process.name,
 				Restarts:        process.restarts,
 				RequestsHandled: process.requestsHandled,
+				RestartHistory:  historyCopy,
+				SuccessRate:     successRate,
+				LastActiveTime:  lastActivePtr,
+				LastErrorTime:   lastErrorPtr,
 			})
 			process.mutex.Unlock()
 		}
@@ -610,7 +775,7 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 	if atomic.LoadInt32(&pool.shouldStop) == 1 {
 		return nil, fmt.Errorf("pool is stopping")
 	}
-	
+
 	// Extract or assign command ID first
 	var cmdID string
 	if id, ok := cmd["id"]; ok {
@@ -619,21 +784,21 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 		cmdID = uuid.New().String()
 		cmd["id"] = cmdID
 	}
-	
+
 	// Track command as queued
 	pool.mutex.Lock()
 	pool.commandToProcess[cmdID] = nil // nil means queued, waiting for worker
 	pool.mutex.Unlock()
-	
+
 	// Create response channel for this command
 	respChan := make(chan commandResponse, 1)
-	
+
 	// Create queued command
 	qCmd := &queuedCommand{
 		cmd:      cmd,
 		response: respChan,
 	}
-	
+
 	// Try to add to queue
 	select {
 	case pool.commandQueue <- qCmd:
@@ -645,10 +810,10 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 		pool.mutex.Unlock()
 		return nil, fmt.Errorf("command queue is full (depth: %d)", pool.queueDepth)
 	}
-	
+
 	// Wait for response from dispatcher
 	resp := <-respChan
-	
+
 	return resp.result, resp.err
 }
 
@@ -656,39 +821,39 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 func (pool *ProcessPool) Interrupt(id string) error {
 	pool.mutex.Lock()
 	defer pool.mutex.Unlock()
-	
+
 	process, exists := pool.commandToProcess[id]
-	
+
 	if !exists {
 		pool.logger.Error().Msgf("No command found with ID: %s", id)
 		return fmt.Errorf("no command found with ID: %s", id)
 	}
-	
+
 	// If process is nil, command is queued but not yet executing - mark as cancelled
 	if process == nil {
 		pool.cancelledCommands[id] = true
 		return nil // Successfully cancelled queued command
 	}
-	
+
 	// Command is executing, send interrupt message directly to the process
 	interruptCmd := map[string]interface{}{
 		"interrupt": "²INTERUPT²",
 	}
-	
+
 	// Temporarily unlock to avoid deadlock with process mutex
 	pool.mutex.Unlock()
-	
+
 	// We need to send this directly without going through SendCommand
 	// to avoid blocking or interfering with the active command
 	err := process.stdin.Encode(interruptCmd)
-	
+
 	if err != nil {
 		pool.logger.Error().Err(err).Msgf("Failed to send interrupt to process %s", process.name)
 	}
-	
+
 	// Relock for defer unlock
 	pool.mutex.Lock()
-	
+
 	// Interrupt request submitted (will be sent asynchronously)
 	return nil
 }
@@ -700,44 +865,48 @@ func (pool *ProcessPool) dispatcher() {
 		case <-pool.stop:
 			// Pool is stopping, exit dispatcher
 			return
-		case qCmd := <-pool.commandQueue:
-			// Get command ID for tracking
-			cmdID, ok := qCmd.cmd["id"].(string)
+		case qCmd, ok := <-pool.commandQueue:
 			if !ok {
+				// Channel is closed, exit dispatcher
+				return
+			}
+			// Get command ID for tracking
+			cmdID, cmdOk := qCmd.cmd["id"].(string)
+			if !cmdOk {
 				cmdID = uuid.New().String()
 				qCmd.cmd["id"] = cmdID
 			}
-			
+
 			// Check if command was cancelled while in queue
 			pool.mutex.RLock()
 			cancelled := pool.cancelledCommands[cmdID]
 			pool.mutex.RUnlock()
-			
+
 			if cancelled {
 				// Command was cancelled, send error response
 				pool.mutex.Lock()
 				delete(pool.cancelledCommands, cmdID)
 				delete(pool.commandToProcess, cmdID)
 				pool.mutex.Unlock()
-				
+
 				qCmd.response <- commandResponse{
 					err: fmt.Errorf("command %s was interrupted while queued", cmdID),
 				}
 				close(qCmd.response)
 				continue
 			}
-			
+
 			// Wait for an available worker with timeout
 			var worker *Process
 			workerTimer := time.NewTimer(pool.workerTimeout)
 			defer workerTimer.Stop()
-			
+
 			select {
 			case <-pool.stop:
 				// Pool is stopping
 				qCmd.response <- commandResponse{err: fmt.Errorf("pool is stopping")}
 				close(qCmd.response)
-				
+
 				// Clean up tracking
 				pool.mutex.Lock()
 				delete(pool.commandToProcess, cmdID)
@@ -749,10 +918,10 @@ func (pool *ProcessPool) dispatcher() {
 			case <-workerTimer.C:
 				// Timeout waiting for worker - workers are likely stuck
 				pool.logger.Error().Msgf("Queue timeout after %v waiting for worker - restarting all workers", pool.workerTimeout)
-				
+
 				// Restart all workers
 				pool.restartAllWorkers()
-				
+
 				// Put command back in queue (at front)
 				go func(cmd *queuedCommand) {
 					select {
@@ -764,50 +933,50 @@ func (pool *ProcessPool) dispatcher() {
 						close(cmd.response)
 					}
 				}(qCmd)
-				
+
 				// Clean up tracking for now (will be re-added when re-queued)
 				pool.mutex.Lock()
 				delete(pool.commandToProcess, cmdID)
 				pool.mutex.Unlock()
 				continue
 			}
-			
+
 			// Check again if cancelled after getting worker
 			pool.mutex.RLock()
 			cancelled = pool.cancelledCommands[cmdID]
 			pool.mutex.RUnlock()
-			
+
 			if cancelled {
 				// Release worker and send error
 				worker.SetBusy(0)
-				
+
 				pool.mutex.Lock()
 				delete(pool.cancelledCommands, cmdID)
 				delete(pool.commandToProcess, cmdID)
 				pool.mutex.Unlock()
-				
+
 				qCmd.response <- commandResponse{
 					err: fmt.Errorf("command %s was interrupted while queued", cmdID),
 				}
 				close(qCmd.response)
 				continue
 			}
-			
+
 			// Update tracking to show which worker is handling this command
 			pool.mutex.Lock()
 			pool.commandToProcess[cmdID] = worker
 			pool.mutex.Unlock()
-			
+
 			// Execute command on worker (in goroutine to not block dispatcher)
 			go func(w *Process, cmd map[string]interface{}, respChan chan commandResponse) {
 				result, err := w.SendCommand(cmd)
-				
+
 				// Clean up tracking
 				pool.mutex.Lock()
 				delete(pool.commandToProcess, cmdID)
 				delete(pool.cancelledCommands, cmdID)
 				pool.mutex.Unlock()
-				
+
 				// Send response
 				respChan <- commandResponse{result: result, err: err}
 				close(respChan)
@@ -819,19 +988,29 @@ func (pool *ProcessPool) dispatcher() {
 // restartAllWorkers restarts all workers in the pool
 func (pool *ProcessPool) restartAllWorkers() {
 	pool.logger.Warn().Msg("Restarting all workers due to queue timeout")
-	
+
 	// Restart each worker
 	pool.mutex.RLock()
 	workers := make([]*Process, len(pool.processes))
 	copy(workers, pool.processes)
 	pool.mutex.RUnlock()
-	
+
 	for _, process := range workers {
 		if process != nil {
+			// Track the restart event with the active command if any
+			// Need to lock to read activeCommandID safely
+			process.commandMutex.Lock()
+			activeCmd := process.activeCommandID
+			process.commandMutex.Unlock()
+
+			if activeCmd == "" {
+				activeCmd = "unknown"
+			}
+			process.addRestartEvent("queue_timeout", activeCmd)
 			process.Restart()
 		}
 	}
-	
+
 	// Wait for at least one worker to be ready
 	if err := pool.WaitForReady(); err != nil {
 		pool.logger.Error().Err(err).Msg("Failed to wait for workers after restart")
@@ -841,10 +1020,10 @@ func (pool *ProcessPool) restartAllWorkers() {
 // StopAll stops all the processes in the process pool.
 func (pool *ProcessPool) StopAll() {
 	pool.SetStop()
-	
+
 	// Close command queue first to prevent new commands
 	close(pool.commandQueue)
-	
+
 	// Drain any remaining queued commands with error responses
 	for qCmd := range pool.commandQueue {
 		qCmd.response <- commandResponse{
@@ -852,7 +1031,7 @@ func (pool *ProcessPool) StopAll() {
 		}
 		close(qCmd.response)
 	}
-	
+
 	for _, process := range pool.processes {
 		process.Stop()
 	}
