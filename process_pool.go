@@ -49,10 +49,31 @@ type Process struct {
 	activeCommandID string         // Currently executing command ID
 	restartHistory  []RestartEvent // Rolling history of last 10 restart events
 	
-	// Response routing for persistent reader
-	responseChannels map[string]chan map[string]interface{} // Command ID -> response channel
-	responseMutex    sync.RWMutex                           // Mutex for response channel map
-	readerDone       chan struct{}                          // Signal reader to stop
+	// Response routing for persistent reader.
+	//
+	// Two maps are maintained so the reader can cheaply distinguish regular
+	// (single-response) commands from streaming commands without extra allocations
+	// per-frame.
+	//
+	// Frame type taxonomy (must stay in sync with persistentReader):
+	//   Terminal   : "success", "error", "interrupted", "stream_done"
+	//   Intermediate: "chunk", "started", "progress", "info"
+	//
+	// For regular channels the intermediate frames are filtered (logged but not
+	// delivered). For streaming channels EVERY frame is delivered; on terminal
+	// frame the channel is closed after delivery.
+	responseChannels  map[string]chan map[string]interface{} // cmdID -> regular (single-response) channel
+	streamingChannels map[string]chan map[string]interface{} // cmdID -> streaming (multi-frame) channel
+	responseMutex     sync.RWMutex                           // Mutex for both maps (reads take RLock, writes Lock)
+	readerDone        chan struct{}                          // Signal reader to stop
+
+	// streamingActivity is keyed by cmdID and stores a pointer to a monotonically
+	// increasing counter that persistentReader bumps on every received frame.
+	// SendCommandStreaming uses this counter to implement the no-activity
+	// ("idle") timeout: if the counter does not advance within p.timeout the
+	// stream is considered dead. This avoids a per-frame channel send from the
+	// reader to a timer goroutine (which would cost allocations on the hot path).
+	streamingActivity map[string]*int64
 	
 	// Performance tracking
 	successCount    int       // Total successful commands
@@ -137,6 +158,8 @@ func (p *Process) Start() {
 	// Initialize response routing
 	p.responseMutex.Lock()
 	p.responseChannels = make(map[string]chan map[string]interface{})
+	p.streamingChannels = make(map[string]chan map[string]interface{})
+	p.streamingActivity = make(map[string]*int64)
 	p.readerDone = make(chan struct{})
 	p.responseMutex.Unlock()
 	
@@ -201,6 +224,19 @@ func (p *Process) cleanupChannelsAndResources() {
 		close(ch)
 	}
 	p.responseChannels = nil
+	// Streaming channels are also closed here so any caller ranging over them
+	// unblocks when the process is torn down.
+	for _, ch := range p.streamingChannels {
+		// Guard against double-close (channel already closed by the reader
+		// after a terminal frame). There is no cheap way to test if a channel
+		// is closed in Go, so we recover from the panic that close() raises.
+		func(c chan map[string]interface{}) {
+			defer func() { _ = recover() }()
+			close(c)
+		}(ch)
+	}
+	p.streamingChannels = nil
+	p.streamingActivity = nil
 	p.responseMutex.Unlock()
 }
 
@@ -440,6 +476,198 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	}
 }
 
+// streamChanCapacity is the buffer size for streaming response channels.
+// Chosen large enough to absorb bursts of audio/video chunks without forcing
+// the reader to block on a slow consumer, yet bounded so that a completely
+// stalled consumer eventually exerts back-pressure instead of growing memory.
+const streamChanCapacity = 256
+
+// SendCommandStreaming sends a command and returns a receive-only channel
+// that will receive EVERY frame (intermediate AND terminal) from the
+// subprocess for this command.
+//
+// Semantics:
+//   - The returned channel is buffered (capacity 256).
+//   - The library closes the channel after the terminal frame is delivered,
+//     OR on error/idle-timeout/interrupt/process-death.
+//   - The caller MUST range over the channel until closed.
+//   - No-activity ("idle") timeout: p.timeout is the MAX gap between frames,
+//     not the total command duration. The timer resets on every frame.
+//   - On timeout or send error the process is marked not ready and restarted
+//     (same behavior as SendCommand).
+//
+// The public single-response SendCommand is unchanged and remains the
+// recommended API for non-streaming workloads.
+func (p *Process) SendCommandStreaming(cmd map[string]interface{}) (<-chan map[string]interface{}, error) {
+	p.SetBusy(1)
+
+	if _, ok := cmd["id"]; !ok {
+		cmd["id"] = uuid.New().String()
+	}
+	if _, ok := cmd["type"]; !ok {
+		cmd["type"] = "main"
+	}
+
+	cmdID := cmd["id"].(string)
+	start := time.Now().UnixMilli()
+
+	// Create streaming channel and activity counter.
+	streamCh := make(chan map[string]interface{}, streamChanCapacity)
+	var activity int64
+
+	p.responseMutex.Lock()
+	if p.streamingChannels == nil {
+		// Process already torn down.
+		p.responseMutex.Unlock()
+		p.SetBusy(0)
+		close(streamCh)
+		return nil, errors.New("process not running")
+	}
+	p.streamingChannels[cmdID] = streamCh
+	p.streamingActivity[cmdID] = &activity
+	p.responseMutex.Unlock()
+
+	// We return a user-facing channel separate from the one the reader writes
+	// to: that way we can multiplex timeout/readerDone signals into the close
+	// of the user channel without racing with the reader's close. `out` is
+	// the user-facing channel; `streamCh` is fed by the reader.
+	out := make(chan map[string]interface{}, streamChanCapacity)
+
+	p.commandMutex.Lock()
+	p.activeCommandID = cmdID
+
+	if err := p.stdin.Encode(cmd); err != nil {
+		p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to send streaming command", p.name)
+		p.mutex.Lock()
+		p.failureCount++
+		p.lastErrorTime = time.Now()
+		p.mutex.Unlock()
+		p.addRestartEvent("send_error", cmdID)
+		p.activeCommandID = ""
+		p.SetReady(0)
+		p.commandMutex.Unlock()
+
+		// Clean up registration.
+		p.responseMutex.Lock()
+		if p.streamingChannels != nil {
+			delete(p.streamingChannels, cmdID)
+			delete(p.streamingActivity, cmdID)
+		}
+		p.responseMutex.Unlock()
+
+		close(out)
+		p.SetBusy(0)
+		go p.Restart()
+		return nil, err
+	}
+
+	jsonCmd, _ := json.Marshal(cmd)
+	p.logger.Debug().Msgf("[nyxsub|%s] Streaming command sent: %v", p.name, string(jsonCmd))
+	p.commandMutex.Unlock()
+
+	// Forwarder goroutine: copies frames reader->out while enforcing the
+	// idle-timeout. Exits when:
+	//   - streamCh is closed by the reader (normal terminal delivery)
+	//   - idle timeout fires
+	//   - readerDone fires (process death / Stop())
+	go func() {
+		defer func() {
+			// Release busy and clear active cmd id ONCE the stream is done.
+			p.activeCommandID = ""
+			p.SetBusy(0)
+			close(out)
+		}()
+
+		// Snapshot readerDone once to avoid repeated mutex reads.
+		p.responseMutex.RLock()
+		readerDone := p.readerDone
+		p.responseMutex.RUnlock()
+
+		// Record the activity counter we started with. Each tick we compare
+		// against the current value; if it's advanced we know a frame
+		// arrived and we reset our reference.
+		lastSeen := atomic.LoadInt64(&activity)
+
+		ticker := time.NewTicker(p.timeout)
+		defer ticker.Stop()
+
+		terminalSeen := false
+		for {
+			select {
+			case frame, ok := <-streamCh:
+				if !ok {
+					// Reader closed the stream (terminal frame already delivered
+					// on the previous iteration, or process death cleanup).
+					if terminalSeen {
+						// Normal terminal completion - success metrics.
+						p.mutex.Lock()
+						p.latency = time.Now().UnixMilli() - start
+						p.requestsHandled++
+						p.successCount++
+						p.lastActiveTime = time.Now()
+						p.mutex.Unlock()
+					}
+					return
+				}
+				// Deliver the frame. Blocking send: streaming consumers must
+				// drain promptly. We still race against readerDone so shutdown
+				// can interrupt a stuck consumer.
+				select {
+				case out <- frame:
+				case <-readerDone:
+					return
+				}
+				// Track whether we saw a terminal frame; the reader will
+				// close streamCh on the next iteration.
+				if t, ok := frame["type"].(string); ok && isTerminalFrameType(t) {
+					terminalSeen = true
+				}
+				// Reset idle timer.
+				ticker.Reset(p.timeout)
+				lastSeen = atomic.LoadInt64(&activity)
+
+			case <-ticker.C:
+				// Check atomically whether activity advanced since last tick.
+				cur := atomic.LoadInt64(&activity)
+				if cur != lastSeen {
+					// A frame did arrive but our goroutine was not scheduled
+					// on the streamCh case in time. Treat as activity.
+					lastSeen = cur
+					continue
+				}
+				// Real idle timeout.
+				p.logger.Error().Msgf("[nyxsub|%s] Streaming idle timeout for command %s", p.name, cmdID)
+				p.mutex.Lock()
+				p.failureCount++
+				p.lastErrorTime = time.Now()
+				p.mutex.Unlock()
+				p.addRestartEvent("timeout", cmdID)
+
+				// Unregister so the reader stops delivering to streamCh and
+				// releases its reference.
+				p.responseMutex.Lock()
+				if p.streamingChannels != nil {
+					if ch, ok := p.streamingChannels[cmdID]; ok && ch == streamCh {
+						delete(p.streamingChannels, cmdID)
+						delete(p.streamingActivity, cmdID)
+					}
+				}
+				p.responseMutex.Unlock()
+
+				p.SetReady(0)
+				go p.Restart()
+				return
+
+			case <-readerDone:
+				// Process being torn down.
+				return
+			}
+		}
+	}()
+
+	return out, nil
+}
+
 // WaitForReady waits until this specific process is ready or times out.
 func (p *Process) WaitForReady() error {
 	start := time.Now()
@@ -454,7 +682,43 @@ func (p *Process) WaitForReady() error {
 	}
 }
 
-// persistentReader continuously reads from stdout and routes responses to waiting commands
+// isTerminalFrameType reports whether a response "type" marks the end of a
+// command exchange. Kept as a small inline-friendly helper so the hot path
+// in persistentReader stays branch-predictable.
+//
+// Terminal types:
+//   "success", "error", "interrupted", "stream_done"
+//
+// Everything else (including "chunk", "started", "progress", "info" and any
+// unknown string) is treated as intermediate.
+func isTerminalFrameType(t string) bool {
+	switch t {
+	case "success", "error", "interrupted", "stream_done":
+		return true
+	}
+	return false
+}
+
+// persistentReader continuously reads from stdout and routes responses to
+// waiting commands.
+//
+// Routing rules:
+//   1. If cmdID has a streaming channel registered, EVERY frame is delivered
+//      to it (blocking send — streams must not silently drop frames). On a
+//      terminal frame the channel is closed after delivery and both streaming
+//      maps are cleared under the write lock.
+//   2. Else if cmdID has a regular response channel, only terminal frames are
+//      delivered; intermediate frames ("chunk", "started", "progress", "info")
+//      are logged and dropped. Delivery is non-blocking (single-slot channel)
+//      to preserve existing behavior.
+//   3. Else the frame is logged at debug level (late response from an
+//      interrupted or already-completed command).
+//
+// Note on mutex strategy: we take the RWMutex once per line and do all
+// routing inside. A previous version took the lock twice (once to check
+// streaming, once for regular); consolidating avoids the extra atomic op per
+// frame. The write-lock path is only taken on terminal streaming frames
+// where we must atomically delete+close.
 func (p *Process) persistentReader() {
 	for {
 		// Check if we should stop
@@ -463,7 +727,7 @@ func (p *Process) persistentReader() {
 			return
 		default:
 		}
-		
+
 		// Read next line (this blocks)
 		line, err := p.stdout.ReadString('\n')
 		if err != nil {
@@ -472,71 +736,145 @@ func (p *Process) persistentReader() {
 			} else {
 				p.logger.Error().Msgf("[nyxsub|%s] Process died (EOF on stdout)", p.name)
 			}
-			// Reader failed (including EOF which means process died), mark as not ready
+			// Reader failed (including EOF which means process died), mark as not ready.
+			// Close any live streaming channels so ranging callers unblock.
+			p.responseMutex.Lock()
+			for id, ch := range p.streamingChannels {
+				func(c chan map[string]interface{}) {
+					defer func() { _ = recover() }()
+					close(c)
+				}(ch)
+				delete(p.streamingChannels, id)
+				delete(p.streamingActivity, id)
+			}
+			p.responseMutex.Unlock()
 			p.SetReady(0)
 			return
 		}
-		
+
 		if line == "" || line == "\n" {
 			continue
 		}
-		
+
 		// Parse JSON response
 		var response map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &response); err != nil {
 			p.logger.Warn().Msgf("[nyxsub|%s] Non JSON message received: '%s'", p.name, line)
 			continue
 		}
-		
-		// Route response to waiting command
-		if cmdID, hasID := response["id"].(string); hasID {
-			p.responseMutex.RLock()
-			respChan, exists := p.responseChannels[cmdID]
-			p.responseMutex.RUnlock()
-			
-			if exists {
-				// Check response type to determine if it's final or intermediate
-				responseType, hasType := response["type"]
-				if !hasType {
-					// No type field - assume it's a final response
-					select {
-					case respChan <- response:
-					default:
-						p.logger.Warn().Msgf("[nyxsub|%s] Response channel full for command %s", p.name, cmdID)
-					}
-				} else {
-					// Check if this is a final response type
-					switch responseType {
-					case "started", "progress", "info":
-						// Intermediate response - log but don't send to channel
-						p.logger.Debug().Msgf("[nyxsub|%s] Intermediate response for %s: %v", p.name, cmdID, responseType)
-					default:
-						// Final response (success, error, interrupted, etc.)
-						select {
-						case respChan <- response:
-						default:
-							p.logger.Warn().Msgf("[nyxsub|%s] Response channel full for command %s", p.name, cmdID)
-						}
-					}
-				}
-			} else {
-				// No one waiting for this response (might be late response from interrupted command)
-				p.logger.Debug().Msgf("[nyxsub|%s] Received response for unknown command %s", p.name, cmdID)
-			}
+
+		cmdID, hasID := response["id"].(string)
+		if !hasID {
+			continue
 		}
+
+		// Look up both maps under a single read-lock.
+		p.responseMutex.RLock()
+		streamCh, isStream := p.streamingChannels[cmdID]
+		respChan, isRegular := p.responseChannels[cmdID]
+		activity := p.streamingActivity[cmdID]
+		p.responseMutex.RUnlock()
+
+		// Bump idle-timeout counter for streaming commands BEFORE delivery,
+		// so the waiter sees activity even if its goroutine is scheduled
+		// between our send and the counter bump.
+		if activity != nil {
+			atomic.AddInt64(activity, 1)
+		}
+
+		if isStream {
+			// Streaming path — deliver every frame.
+			responseType, _ := response["type"].(string)
+			terminal := isTerminalFrameType(responseType)
+
+			// Blocking send: streaming callers MUST drain their channel in a
+			// timely manner. Capacity is 256, so only sustained back-pressure
+			// can reach this branch. We still honor readerDone so shutdown
+			// can interrupt a stuck send.
+			select {
+			case streamCh <- response:
+			case <-p.readerDone:
+				return
+			}
+
+			if terminal {
+				// Close the channel and remove from both maps atomically.
+				p.responseMutex.Lock()
+				// Double-check: Stop() may have cleared the map concurrently.
+				if ch, ok := p.streamingChannels[cmdID]; ok && ch == streamCh {
+					delete(p.streamingChannels, cmdID)
+					delete(p.streamingActivity, cmdID)
+					func(c chan map[string]interface{}) {
+						defer func() { _ = recover() }()
+						close(c)
+					}(streamCh)
+				}
+				p.responseMutex.Unlock()
+			}
+			continue
+		}
+
+		if isRegular {
+			responseType, hasType := response["type"]
+			if !hasType {
+				// No type field - assume it's a final response
+				select {
+				case respChan <- response:
+				default:
+					p.logger.Warn().Msgf("[nyxsub|%s] Response channel full for command %s", p.name, cmdID)
+				}
+				continue
+			}
+			// Filter intermediate frames (defensive: "chunk" added so a
+			// streaming-emitting subprocess accidentally called via SendCommand
+			// does not deliver a chunk as the final response).
+			switch responseType {
+			case "started", "progress", "info", "chunk":
+				p.logger.Debug().Msgf("[nyxsub|%s] Intermediate response for %s: %v", p.name, cmdID, responseType)
+			default:
+				// Final response (success, error, interrupted, stream_done, unknown)
+				select {
+				case respChan <- response:
+				default:
+					p.logger.Warn().Msgf("[nyxsub|%s] Response channel full for command %s", p.name, cmdID)
+				}
+			}
+			continue
+		}
+
+		// No one waiting for this response (likely a late frame after interrupt).
+		p.logger.Debug().Msgf("[nyxsub|%s] Received response for unknown command %s", p.name, cmdID)
 	}
 }
 
-// queuedCommand represents a command waiting in the queue
+// queuedCommand represents a command waiting in the queue.
+//
+// For non-streaming commands, `response` receives a single commandResponse
+// containing either the final map or an error, then is closed.
+//
+// For streaming commands, `streamResponse` receives a single streamSetup
+// message containing either (a) the worker's stream channel and nil err, or
+// (b) a nil channel and an error. Once delivered, the caller ranges over the
+// worker's stream channel directly until the library closes it.
 type queuedCommand struct {
-	cmd      map[string]interface{}
-	response chan commandResponse
+	cmd            map[string]interface{}
+	response       chan commandResponse // nil for streaming commands
+	streamResponse chan streamSetup     // nil for non-streaming commands
 }
 
 // commandResponse holds the response or error from a command
 type commandResponse struct {
 	result map[string]interface{}
 	err    error
+}
+
+// streamSetup is the one-shot handshake result for a streaming command:
+// either the caller receives the stream channel (ch != nil, err == nil) or
+// an error (ch == nil, err != nil). After delivery the caller ranges ch
+// directly.
+type streamSetup struct {
+	ch  <-chan map[string]interface{}
+	err error
 }
 
 // ProcessPool is a pool of processes.
@@ -817,6 +1155,56 @@ func (pool *ProcessPool) SendCommand(cmd map[string]interface{}) (map[string]int
 	return resp.result, resp.err
 }
 
+// SendCommandStreaming sends a command to a worker and returns a channel
+// delivering every frame for that command.
+//
+// See Process.SendCommandStreaming for semantics. At the pool level this
+// function additionally:
+//   - Respects the queue depth limit (returns error if queue is full).
+//   - Honors Interrupt(cmdID) both while queued and while streaming.
+//   - Maintains commandToProcess tracking for the full lifetime of the stream.
+//
+// The returned channel is closed by the library after the terminal frame,
+// or on error/timeout/interrupt/process-death. Range over it until closed.
+func (pool *ProcessPool) SendCommandStreaming(cmd map[string]interface{}) (<-chan map[string]interface{}, error) {
+	if atomic.LoadInt32(&pool.shouldStop) == 1 {
+		return nil, fmt.Errorf("pool is stopping")
+	}
+
+	var cmdID string
+	if id, ok := cmd["id"]; ok {
+		cmdID = id.(string)
+	} else {
+		cmdID = uuid.New().String()
+		cmd["id"] = cmdID
+	}
+
+	pool.mutex.Lock()
+	pool.commandToProcess[cmdID] = nil // queued
+	pool.mutex.Unlock()
+
+	setupChan := make(chan streamSetup, 1)
+	qCmd := &queuedCommand{
+		cmd:            cmd,
+		streamResponse: setupChan,
+	}
+
+	select {
+	case pool.commandQueue <- qCmd:
+	default:
+		pool.mutex.Lock()
+		delete(pool.commandToProcess, cmdID)
+		pool.mutex.Unlock()
+		return nil, fmt.Errorf("command queue is full (depth: %d)", pool.queueDepth)
+	}
+
+	setup := <-setupChan
+	if setup.err != nil {
+		return nil, setup.err
+	}
+	return setup.ch, nil
+}
+
 // Interrupt sends an interrupt signal to the process handling the specified command ID.
 func (pool *ProcessPool) Interrupt(id string) error {
 	pool.mutex.Lock()
@@ -889,10 +1277,14 @@ func (pool *ProcessPool) dispatcher() {
 				delete(pool.commandToProcess, cmdID)
 				pool.mutex.Unlock()
 
-				qCmd.response <- commandResponse{
-					err: fmt.Errorf("command %s was interrupted while queued", cmdID),
+				errMsg := fmt.Errorf("command %s was interrupted while queued", cmdID)
+				if qCmd.streamResponse != nil {
+					qCmd.streamResponse <- streamSetup{err: errMsg}
+					close(qCmd.streamResponse)
+				} else {
+					qCmd.response <- commandResponse{err: errMsg}
+					close(qCmd.response)
 				}
-				close(qCmd.response)
 				continue
 			}
 
@@ -904,8 +1296,14 @@ func (pool *ProcessPool) dispatcher() {
 			select {
 			case <-pool.stop:
 				// Pool is stopping
-				qCmd.response <- commandResponse{err: fmt.Errorf("pool is stopping")}
-				close(qCmd.response)
+				errMsg := fmt.Errorf("pool is stopping")
+				if qCmd.streamResponse != nil {
+					qCmd.streamResponse <- streamSetup{err: errMsg}
+					close(qCmd.streamResponse)
+				} else {
+					qCmd.response <- commandResponse{err: errMsg}
+					close(qCmd.response)
+				}
 
 				// Clean up tracking
 				pool.mutex.Lock()
@@ -929,8 +1327,14 @@ func (pool *ProcessPool) dispatcher() {
 						// Re-queued successfully
 					case <-pool.stop:
 						// Pool stopping, abandon
-						cmd.response <- commandResponse{err: fmt.Errorf("pool stopping during restart")}
-						close(cmd.response)
+						errMsg := fmt.Errorf("pool stopping during restart")
+						if cmd.streamResponse != nil {
+							cmd.streamResponse <- streamSetup{err: errMsg}
+							close(cmd.streamResponse)
+						} else {
+							cmd.response <- commandResponse{err: errMsg}
+							close(cmd.response)
+						}
 					}
 				}(qCmd)
 
@@ -955,10 +1359,14 @@ func (pool *ProcessPool) dispatcher() {
 				delete(pool.commandToProcess, cmdID)
 				pool.mutex.Unlock()
 
-				qCmd.response <- commandResponse{
-					err: fmt.Errorf("command %s was interrupted while queued", cmdID),
+				errMsg := fmt.Errorf("command %s was interrupted while queued", cmdID)
+				if qCmd.streamResponse != nil {
+					qCmd.streamResponse <- streamSetup{err: errMsg}
+					close(qCmd.streamResponse)
+				} else {
+					qCmd.response <- commandResponse{err: errMsg}
+					close(qCmd.response)
 				}
-				close(qCmd.response)
 				continue
 			}
 
@@ -967,20 +1375,58 @@ func (pool *ProcessPool) dispatcher() {
 			pool.commandToProcess[cmdID] = worker
 			pool.mutex.Unlock()
 
-			// Execute command on worker (in goroutine to not block dispatcher)
-			go func(w *Process, cmd map[string]interface{}, respChan chan commandResponse) {
-				result, err := w.SendCommand(cmd)
+			// Execute command on worker (in goroutine to not block dispatcher).
+			// Streaming and non-streaming paths are structurally similar but
+			// differ in (a) which worker method is called and (b) when the
+			// pool's commandToProcess tracking is released: for streams the
+			// tracking must live until the stream closes, otherwise
+			// Interrupt() can't find the worker while frames are still flowing.
+			if qCmd.streamResponse != nil {
+				go func(w *Process, cmd map[string]interface{}, setupChan chan streamSetup) {
+					workerCh, err := w.SendCommandStreaming(cmd)
+					if err != nil {
+						pool.mutex.Lock()
+						delete(pool.commandToProcess, cmdID)
+						delete(pool.cancelledCommands, cmdID)
+						pool.mutex.Unlock()
 
-				// Clean up tracking
-				pool.mutex.Lock()
-				delete(pool.commandToProcess, cmdID)
-				delete(pool.cancelledCommands, cmdID)
-				pool.mutex.Unlock()
+						setupChan <- streamSetup{err: err}
+						close(setupChan)
+						return
+					}
+					// Tee the worker channel into a user-facing channel so
+					// we can detect completion (worker channel close) and
+					// clean up pool tracking without stealing frames from
+					// the caller.
+					userCh := make(chan map[string]interface{}, streamChanCapacity)
+					setupChan <- streamSetup{ch: userCh}
+					close(setupChan)
 
-				// Send response
-				respChan <- commandResponse{result: result, err: err}
-				close(respChan)
-			}(worker, qCmd.cmd, qCmd.response)
+					for frame := range workerCh {
+						userCh <- frame
+					}
+					close(userCh)
+
+					pool.mutex.Lock()
+					delete(pool.commandToProcess, cmdID)
+					delete(pool.cancelledCommands, cmdID)
+					pool.mutex.Unlock()
+				}(worker, qCmd.cmd, qCmd.streamResponse)
+			} else {
+				go func(w *Process, cmd map[string]interface{}, respChan chan commandResponse) {
+					result, err := w.SendCommand(cmd)
+
+					// Clean up tracking
+					pool.mutex.Lock()
+					delete(pool.commandToProcess, cmdID)
+					delete(pool.cancelledCommands, cmdID)
+					pool.mutex.Unlock()
+
+					// Send response
+					respChan <- commandResponse{result: result, err: err}
+					close(respChan)
+				}(worker, qCmd.cmd, qCmd.response)
+			}
 		}
 	}
 }

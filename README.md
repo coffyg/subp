@@ -82,6 +82,88 @@ if err != nil {
 fmt.Println(response["result"])
 ```
 
+## Streaming commands
+
+For subprocesses that emit multiple frames per command (e.g. TTS engines streaming audio chunks mid-inference), use `SendCommandStreaming`. It returns a receive-only channel that delivers EVERY frame — intermediate and terminal — and is closed by the library once the terminal frame arrives (or on error / idle-timeout / interrupt / process death).
+
+```go
+ch, err := pool.SendCommandStreaming(map[string]interface{}{
+    "id":   "tts-job-42",
+    "text": "The quick brown fox jumps over the lazy dog.",
+})
+if err != nil {
+    return err
+}
+for frame := range ch {
+    switch frame["type"] {
+    case "chunk":
+        // Intermediate payload (e.g. audio chunk).
+        handleAudio(frame["data"])
+    case "progress", "started", "info":
+        // Optional telemetry.
+    case "success", "stream_done":
+        // Terminal: channel will close on the next iteration.
+    case "error":
+        return fmt.Errorf("worker error: %v", frame["message"])
+    case "interrupted":
+        return fmt.Errorf("interrupted")
+    }
+}
+// ch is closed here.
+```
+
+### Frame type taxonomy
+
+The library uses the `type` field to classify every frame:
+
+| Frame type    | Class        | Regular `SendCommand`       | Streaming `SendCommandStreaming` |
+|---------------|--------------|-----------------------------|----------------------------------|
+| `success`     | terminal     | delivered as final response | delivered then channel closed    |
+| `error`       | terminal     | delivered as final response | delivered then channel closed    |
+| `interrupted` | terminal     | delivered as final response | delivered then channel closed    |
+| `stream_done` | terminal     | delivered as final response | delivered then channel closed    |
+| `chunk`       | intermediate | filtered (logged, dropped)  | delivered                        |
+| `started`     | intermediate | filtered (logged, dropped)  | delivered                        |
+| `progress`    | intermediate | filtered (logged, dropped)  | delivered                        |
+| `info`        | intermediate | filtered (logged, dropped)  | delivered                        |
+
+Any unknown `type` is treated as terminal (safer default — delivered to the caller).
+
+### Idle timeout (differs from `SendCommand`)
+
+Streaming sessions can be long (think: TTS for a novel-length text), so `comTimeout` is applied as a **no-activity** timeout instead of a total command timeout:
+
+- The timer resets on every frame received (intermediate OR terminal).
+- If no frame arrives within `comTimeout`, the channel is closed, the process is marked not-ready, and a restart is triggered.
+
+This lets you set a reasonable per-chunk deadline without capping total stream duration.
+
+### Interrupt
+
+`pool.Interrupt(cmdID)` works the same for streaming commands as for regular ones. The subprocess is expected to respond with an `interrupted` terminal frame; the library then closes the channel.
+
+### Buffering & back-pressure
+
+The streaming channel is buffered at capacity 256. If the consumer falls behind, the reader goroutine blocks on send — frames are never silently dropped (unlike the non-streaming path, which uses single-slot channels and logs a warning on overflow). Drain promptly.
+
+### Subprocess protocol
+
+Emit one JSON object per line on stdout. Example worker snippet:
+
+```python
+import json, sys
+def emit(obj): sys.stdout.write(json.dumps(obj) + "\n"); sys.stdout.flush()
+
+emit({"type": "ready"})
+for line in sys.stdin:
+    cmd = json.loads(line)
+    cid = cmd["id"]
+    emit({"type": "started", "id": cid})
+    for i, chunk in enumerate(generate_chunks(cmd["text"])):
+        emit({"type": "chunk", "id": cid, "seq": i, "audio_b64": chunk})
+    emit({"type": "success", "id": cid})
+```
+
 ## Running Tests
 
 To run the full test suite:
