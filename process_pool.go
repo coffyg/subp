@@ -421,8 +421,12 @@ func (p *Process) SendCommand(cmd map[string]interface{}) (map[string]interface{
 	}
 
 	// Log the command sent
-	jsonCmd, _ := json.Marshal(cmd)
-	p.logger.Debug().Msgf("[nyxsub|%s] Command sent: %v", p.name, string(jsonCmd))
+	// The re-encode is for the debug line only — skip it unless debug is on
+	// (it is a full second marshal of the command, SSR input included).
+	if ev := p.logger.Debug(); ev.Enabled() {
+		jsonCmd, _ := json.Marshal(cmd)
+		ev.Msgf("[nyxsub|%s] Command sent: %v", p.name, string(jsonCmd))
+	}
 	
 	// Unlock immediately after sending - we don't need to hold the lock while waiting
 	p.commandMutex.Unlock()
@@ -561,8 +565,10 @@ func (p *Process) SendCommandStreaming(cmd map[string]interface{}) (<-chan map[s
 		return nil, err
 	}
 
-	jsonCmd, _ := json.Marshal(cmd)
-	p.logger.Debug().Msgf("[nyxsub|%s] Streaming command sent: %v", p.name, string(jsonCmd))
+	if ev := p.logger.Debug(); ev.Enabled() {
+		jsonCmd, _ := json.Marshal(cmd)
+		ev.Msgf("[nyxsub|%s] Streaming command sent: %v", p.name, string(jsonCmd))
+	}
 	p.commandMutex.Unlock()
 
 	// Forwarder goroutine: copies frames reader->out while enforcing the
@@ -728,8 +734,10 @@ func (p *Process) persistentReader() {
 		default:
 		}
 
-		// Read next line (this blocks)
-		line, err := p.stdout.ReadString('\n')
+		// Read next line (this blocks). ReadBytes, not ReadString: the line is
+		// only ever handed to json.Unmarshal, and ReadString + []byte(line)
+		// copied every response (a whole rendered page for SSR) twice.
+		line, err := p.stdout.ReadBytes('\n')
 		if err != nil {
 			if err != io.EOF {
 				p.logger.Error().Err(err).Msgf("[nyxsub|%s] Failed to read stdout in persistent reader", p.name)
@@ -752,13 +760,13 @@ func (p *Process) persistentReader() {
 			return
 		}
 
-		if line == "" || line == "\n" {
+		if len(line) == 0 || (len(line) == 1 && line[0] == '\n') {
 			continue
 		}
 
 		// Parse JSON response
 		var response map[string]interface{}
-		if err := json.Unmarshal([]byte(line), &response); err != nil {
+		if err := json.Unmarshal(line, &response); err != nil {
 			p.logger.Warn().Msgf("[nyxsub|%s] Non JSON message received: '%s'", p.name, line)
 			continue
 		}
@@ -1290,11 +1298,15 @@ func (pool *ProcessPool) dispatcher() {
 
 			// Wait for an available worker with timeout
 			var worker *Process
+			// No defer here: the dispatcher never returns, so a deferred Stop
+			// would never run and every dispatched command would keep its
+			// timer (and the defer record) on the heap for the life of the
+			// process. Stop it explicitly on each branch instead.
 			workerTimer := time.NewTimer(pool.workerTimeout)
-			defer workerTimer.Stop()
 
 			select {
 			case <-pool.stop:
+				workerTimer.Stop()
 				// Pool is stopping
 				errMsg := fmt.Errorf("pool is stopping")
 				if qCmd.streamResponse != nil {
@@ -1311,6 +1323,7 @@ func (pool *ProcessPool) dispatcher() {
 				pool.mutex.Unlock()
 				continue
 			case worker = <-pool.availableWorkers:
+				workerTimer.Stop()
 				// Got a worker
 				worker.SetBusy(1)
 			case <-workerTimer.C:
