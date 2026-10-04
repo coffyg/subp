@@ -182,10 +182,17 @@ func (p *Process) Start() {
 func (p *Process) Stop() {
 	p.SetReady(0)
 	
-	// Signal reader to stop
+	// Signal reader to stop. Stop can run twice on one process: StopAll stops it while a command is in
+	// flight, the command sees readerDone and calls Restart → Stop again. A second close panicked with
+	// responseMutex held, the deferred cleanup in SendCommand then waited on that mutex forever, and
+	// StopAll hung in wg.Wait (every fws publish under SSR load).
 	p.responseMutex.Lock()
 	if p.readerDone != nil {
-		close(p.readerDone)
+		select {
+		case <-p.readerDone: // already closed by a concurrent Stop
+		default:
+			close(p.readerDone)
+		}
 	}
 	p.responseMutex.Unlock()
 	
